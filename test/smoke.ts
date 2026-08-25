@@ -1758,6 +1758,105 @@ async function main() {
       rmSync(rlDir, { recursive: true, force: true });
     }
 
+    // Being the default is not enough to be handed a turn the account cannot
+    // serve. On 2026-08-25 the default ran out of its seven-day window at
+    // 00:15 and every conversation opened until 04:00 the next day still
+    // started on it, spending its first turn earning "You've hit your weekly
+    // limit" while two other subscriptions sat at 69% and 88%.
+    {
+      const availDir = mkdtempSync(joinPath(tmpdir(), "oc-claude-avail-"));
+      const prevAvailQuota = process.env.OPENCODE_CLAUDE_QUOTA_STORE;
+      const prevAvailRl = process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE;
+      process.env.OPENCODE_CLAUDE_QUOTA_STORE = joinPath(availDir, "quota.json");
+      process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE = joinPath(availDir, "rl.json");
+      try {
+        const { recordQuotaFromHeaders, __resetQuotaStore } = await import(
+          "../src/quota.ts"
+        );
+        const { accountAvailability, pickAccountForNewConversation } =
+          await import("../src/account-availability.ts");
+        const { recordRateLimitErrorText } = await import("../src/rate-limit.ts");
+        __resetQuotaStore();
+        configureAccounts([
+          { id: "dry", label: "Dry", configDir: "/tmp/oc-claude-dry", default: true },
+          { id: "thin", label: "Thin", configDir: "/tmp/oc-claude-thin" },
+          { id: "fat", label: "Fat", configDir: "/tmp/oc-claude-fat" },
+        ]);
+        const spent = (utilization: number, resetSeconds?: number) =>
+          new Headers({
+            "anthropic-ratelimit-unified-7d-utilization": String(utilization),
+            ...(resetSeconds !== undefined
+              ? { "anthropic-ratelimit-unified-7d-reset": String(resetSeconds) }
+              : {}),
+          });
+        const inThreeDays = Math.floor((Date.now() + 259_200_000) / 1000);
+
+        // Nothing measured yet is not exhaustion: the default stands.
+        assert.equal(accountAvailability("dry").usable, true);
+        assert.equal(pickAccountForNewConversation().account.id, "dry");
+
+        recordQuotaFromHeaders("dry", spent(1, inThreeDays));
+        recordQuotaFromHeaders("thin", spent(0.9, inThreeDays));
+        recordQuotaFromHeaders("fat", spent(0.1, inThreeDays));
+        const diverted = pickAccountForNewConversation();
+        assert.equal(diverted.account.id, "fat", "the most room left wins");
+        assert.equal(diverted.divertedFrom?.account.id, "dry");
+        assert.match(diverted.divertedFrom?.reason ?? "", /7d quota spent/);
+
+        // A signed-out account is not a fallback.
+        assert.equal(
+          pickAccountForNewConversation({
+            isAuthenticated: (account) => account.id !== "fat",
+          }).account.id,
+          "thin",
+        );
+
+        // A recorded hard limit takes an account out of the running even with
+        // quota headroom on record.
+        recordRateLimitErrorText(
+          "You've hit your session limit · resets 1:10am (Europe/Kyiv)",
+          "fat",
+        );
+        assert.equal(accountAvailability("fat").usable, false);
+        assert.equal(pickAccountForNewConversation().account.id, "thin");
+
+        // Nowhere better to go: the default keeps the turn and fails with its
+        // own message rather than pinning the failure on another subscription.
+        recordQuotaFromHeaders("thin", spent(1, inThreeDays));
+        const nowhere = pickAccountForNewConversation();
+        assert.equal(nowhere.account.id, "dry");
+        assert.equal(nowhere.divertedFrom, undefined);
+
+        // A spent window that names no refill time is one stale reading, not a
+        // verdict, and must not retire the account forever.
+        recordQuotaFromHeaders("dry", spent(1));
+        assert.equal(
+          accountAvailability("dry").usable,
+          true,
+          "a zero with no reset stamp does not disqualify",
+        );
+        assert.equal(pickAccountForNewConversation().account.id, "dry");
+      } finally {
+        if (prevAvailQuota === undefined) {
+          delete process.env.OPENCODE_CLAUDE_QUOTA_STORE;
+        } else {
+          process.env.OPENCODE_CLAUDE_QUOTA_STORE = prevAvailQuota;
+        }
+        if (prevAvailRl === undefined) {
+          delete process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE;
+        } else {
+          process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE = prevAvailRl;
+        }
+        rmSync(availDir, { recursive: true, force: true });
+        // The roster the rest of this block expects.
+        configureAccounts([
+          { id: "work", label: "Work", configDir: "/tmp/oc-claude-work", default: true },
+          { id: "personal", label: "Personal", configDir: "/tmp/oc-claude-personal" },
+        ]);
+      }
+    }
+
+
     // A scoped account reads ONLY its own Claude home — never the ambient one.
     {
       const scoped = listClaudeCredentialsCandidates("/home/tester", {}, {

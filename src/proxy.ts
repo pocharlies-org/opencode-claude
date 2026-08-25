@@ -43,6 +43,9 @@ import {
   type ClaudeAccount,
 } from "./accounts.js";
 import {
+  pickAccountForNewConversation,
+} from "./account-availability.js";
+import {
   clearAccountCredentials,
   completeAccountLogin,
   findPendingLoginByState,
@@ -1088,6 +1091,11 @@ const liveSessionAccounts = new Map<string, string>();
  * Otherwise the session stays on whatever it was bound to, so a conversation
  * never silently hops subscriptions mid-way (which would also strand its
  * Claude transcript in another account's home).
+ *
+ * Only a conversation with neither — no request, no binding — is placed, and
+ * being the registry default is not enough to be handed a turn it cannot
+ * serve. See account-availability.ts for why this is the one safe place to
+ * choose.
  */
 function resolveTurnAccount(
   conversationKey: string,
@@ -1104,7 +1112,21 @@ function resolveTurnAccount(
     if (account) return { account, switched: false };
     throw new AccountError(`session is bound to removed account "${bound}"`, 409);
   }
-  return { account: getDefaultAccount(), switched: false };
+  const placement = pickAccountForNewConversation({
+    isAuthenticated: (account) => credentialProbe(account),
+  });
+  if (placement.divertedFrom) {
+    log.info(
+      "[opencode-claude] default account cannot serve; placing new conversation elsewhere",
+      {
+        conversationKey,
+        skipped: placement.divertedFrom.account.id,
+        reason: placement.divertedFrom.reason,
+        account: placement.account.id,
+      },
+    );
+  }
+  return { account: placement.account, switched: false };
 }
 
 /** Env flag to turn the `[account]` title prefix off. */
