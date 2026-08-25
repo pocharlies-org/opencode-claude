@@ -1116,7 +1116,10 @@ function resolveTurnAccount(
     isAuthenticated: (account) => credentialProbe(account),
   });
   if (placement.divertedFrom) {
-    log.info(
+    // warn, not info: info is debug-gated, and a conversation that starts on a
+    // subscription other than the default is both an anomaly and sticky from
+    // here on. It has to be readable after the fact without the debug flag.
+    log.warn(
       "[opencode-claude] default account cannot serve; placing new conversation elsewhere",
       {
         conversationKey,
