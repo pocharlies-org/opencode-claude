@@ -276,7 +276,9 @@ function ensureAccountProviderConfigs(config: Record<string, any>): void {
     config.provider = {};
   }
   for (const account of getAccounts()) {
-    if (account.isDefault) continue; // handled by ensureClaudeProviderConfig
+    // The default account gets its own `claude-code-<id>` provider too. Being
+    // reachable ONLY through the bare id made "choose this account" and "say
+    // nothing" the same gesture, and that is the bug, not a shortcut.
     const id = providerIdForAccount(account.id, false);
     const existing = config.provider[id] ?? {};
     const port = getProxyPort();
@@ -365,7 +367,7 @@ function ensureClaudeProviderConfig(
     name:
       customName ||
       (isMultiAccount()
-        ? providerNameForAccount(getDefaultAccount())
+        ? "Claude Code · this session’s account"
         : "Claude Code"),
     npm: existing.npm ?? OPENAI_COMPATIBLE_NPM,
     options: {
@@ -717,21 +719,22 @@ export const ClaudeCodePlugin: Plugin = async (
       // splits it so the proxy gets both without a second switch to keep in
       // sync with the picker.
       const selected = resolveClaudeModelSelection(hookInput.model.id, variant);
-      // With one provider per account the provider IS the account; the
-      // `model@account` form still works for anything pinned to it earlier.
-      // The DEFAULT account keeps the bare `claude-code` provider id, so
-      // accountIdFromProviderId returns null for it — indistinguishable from
-      // "no account requested". The proxy then falls back to the session's
-      // sticky binding, and picking the default account in the model picker
-      // silently did nothing: the turn kept running on whatever account the
-      // conversation was already pinned to, while the model name showed the
-      // DEFAULT account's quota. Two accounts were spent to zero this way
-      // while the picker read 68% free.
+      // With one provider per account the provider IS the account, and that now
+      // includes the default one: every account is reachable as
+      // `claude-code-<id>`. So a provider that names no account is not a
+      // disguised vote for the default — it is silence, and silence must leave
+      // the session on whatever it was already bound to.
       //
-      // Choosing the bare provider IS choosing the default account. Say so.
+      // It used to send the default explicitly here, to fix picking the default
+      // in the picker doing nothing. That made every legacy session pinned to
+      // the bare provider assert the default account on every turn, and turned
+      // `set-default` into a mass reassignment: 32 conversations moved, each one
+      // then paying to rebuild its history against the only account with quota
+      // left. Removing the ambiguity fixes both without that trade.
+      //
+      // The `model@account` form still works for anything pinned to it earlier.
       const providerAccount = isClaudeProviderId(hookInput.model.providerID)
-        ? (accountIdFromProviderId(hookInput.model.providerID) ??
-            (isMultiAccount() ? getDefaultAccount().id : null))
+        ? accountIdFromProviderId(hookInput.model.providerID)
         : null;
       const account = providerAccount ?? selected.account;
       if (account) {

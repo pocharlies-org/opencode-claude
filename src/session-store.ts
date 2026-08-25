@@ -20,7 +20,11 @@ export type ClaudeSessionBinding = {
    * continuing a conversation. The Claude transcript this pointed at lives in
    * the OLD account's home and is unreachable from the new one, so the next
    * turn must start FRESH — and must not pay to carry the old history into a
-   * different subscription. Cleared as soon as a real session id is recorded.
+   * different subscription.
+   *
+   * Only machinery sets this. An account change the operator made in a live
+   * session clears it instead: that switch is a request for continuity, not an
+   * accident to contain. Also cleared as soon as a real session id is recorded.
    */
   rebound?: boolean;
   updatedAt: number;
@@ -154,33 +158,46 @@ export function bindConversationAccount(
   conversationKey: string,
   accountId: string,
   accountLabel: string,
+  opts?: {
+    /**
+     * The operator moved THIS live conversation to THIS account, right now —
+     * by picking an account-scoped provider in a session this process was
+     * already serving, or by calling the switch tool on it.
+     *
+     * Only then is carrying the history the point rather than the accident.
+     */
+    deliberate?: boolean;
+  },
 ): void {
   const store = readStore();
   const existing = store[conversationKey];
   if (existing?.accountId === accountId) return;
   // Moving a conversation to another account kills its resume target, and the
   // next turn would rebuild the whole history to compensate. That is the exact
-  // cost that emptied two subscriptions on 2026-08-20, and it is now charged
-  // per conversation on every account change — including the ones nobody asked
-  // for, such as a default-account header arriving where none used to.
+  // cost that emptied two subscriptions on 2026-08-20 — charged per
+  // conversation, for moves nobody asked for.
   const movedAccount = Boolean(
     existing && existing.accountId && existing.accountId !== accountId,
   );
-  store[conversationKey] = {
+  const deliberate = opts?.deliberate === true;
+  const next: ClaudeSessionBinding = {
     ...(existing ?? { conversationKey, foreignSessionId: "" }),
-    ...(movedAccount ? { rebound: true } : {}),
     conversationKey,
     // Switching account invalidates the resume target: the transcript lives in
     // the other account's Claude home and resuming it there would either fail
     // or, worse, silently continue someone else's conversation.
-    foreignSessionId:
-      existing && existing.accountId && existing.accountId !== accountId
-        ? ""
-        : (existing?.foreignSessionId ?? ""),
+    foreignSessionId: movedAccount ? "" : (existing?.foreignSessionId ?? ""),
     accountId,
     accountLabel,
     updatedAt: Date.now(),
   };
+  // An unasked-for move must not pay to follow. An asked-for one must — and it
+  // also overrules a flag machinery left behind, because the operator asking
+  // for this conversation on this account is a later and stronger statement
+  // than whatever swept it here before.
+  if (movedAccount && !deliberate) next.rebound = true;
+  if (deliberate) delete next.rebound;
+  store[conversationKey] = next;
   writeStore(store);
 }
 

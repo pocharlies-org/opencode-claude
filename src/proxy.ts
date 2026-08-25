@@ -927,8 +927,11 @@ async function handlePanelRoutes(
         return jsonError(`unknown session "${conversationKey}"`, 404);
       }
       // Same rule as an in-band switch: the resume target belongs to the old
-      // account's Claude home and must not follow the session across.
-      bindConversationAccount(conversationKey, target.id, target.label);
+      // account's Claude home and must not follow the session across. Someone
+      // pressed this, so the history does follow, in full.
+      bindConversationAccount(conversationKey, target.id, target.label, {
+        deliberate: true,
+      });
       return Response.json({ conversationKey, account: target.id });
     }
   } catch (err) {
@@ -1061,6 +1064,24 @@ function selectionFromRequest(
 }
 
 /**
+ * Account this process last served for a live conversation.
+ *
+ * This is the whole definition of "the operator switched accounts just now",
+ * and it is deliberately memory-only. A conversation this process has already
+ * served a turn for is one sitting in an open window; seeing its account change
+ * between two of those turns means somebody changed it, because nothing else
+ * can. A conversation whose first turn here already disagrees with the store is
+ * something else entirely — resumed from the session list, swept by machinery,
+ * or pinned to a provider whose meaning changed underneath it — and those must
+ * never pay to move.
+ *
+ * Dying with the process is the point, not a limitation: after a restart no
+ * conversation is "in the active window" yet, and the safe answer is the one
+ * that costs nothing.
+ */
+const liveSessionAccounts = new Map<string, string>();
+
+/**
  * Which subscription runs this turn.
  *
  * Explicit beats sticky: picking `opus@work` moves the session to `work`.
@@ -1158,14 +1179,27 @@ async function handleChatCompletions(
   // Keyed on the chat, not on the namespaced request key, so a title/summary
   // request bills the same subscription as the turn that triggered it.
   const { account, switched } = resolveTurnAccount(sessionKey, selection.account);
+  // Read before the write below: the account this process served on the
+  // PREVIOUS turn of this same live conversation.
+  const servedAccount = liveSessionAccounts.get(sessionKey);
+  const deliberateSwitch = Boolean(servedAccount && servedAccount !== account.id);
   if (switched) {
     log.info("[opencode-claude] session moved to another Claude account", {
       conversationKey: sessionKey,
       account: account.id,
+      from: servedAccount ?? "(not served by this process)",
+      deliberate: deliberateSwitch,
     });
   }
+  if (!metaKind) {
+    // Meta requests (title, summary) are not the operator steering anything,
+    // so they must not be able to make the next real turn look like a switch.
+    liveSessionAccounts.set(sessionKey, account.id);
+  }
   if (!metaKind && isMultiAccount()) {
-    bindConversationAccount(sessionKey, account.id, account.label);
+    bindConversationAccount(sessionKey, account.id, account.label, {
+      deliberate: deliberateSwitch,
+    });
   }
   const accountConfig = account.configDir ? accountConfigDir(account) : undefined;
 
@@ -1513,10 +1547,19 @@ async function handleChatCompletions(
   // A resumable Claude session already owns the conversation context. When
   // that transcript is lost, start Claude fresh but transfer the history that
   // OpenCode still has instead of silently reducing the turn to one message.
+  // A switch the operator just made carries the conversation WHOLE. The cap
+  // exists to bound moves nobody asked for; this move is the request itself,
+  // and half a conversation is not what "switch account" means. OpenCode ships
+  // the full message list on every request anyway — the same way any other
+  // provider would get it — so there is nothing to reconstruct, only a
+  // decision to stop truncating.
   const transcript =
     resume || reboundByMachinery
       ? ""
-      : buildConversationTranscript(priorMessagesOf(messages));
+      : buildConversationTranscript(
+          priorMessagesOf(messages),
+          deliberateSwitch ? Number.POSITIVE_INFINITY : historyMaxChars(),
+        );
   if (reboundByMachinery) {
     log.warn(
       "[opencode-claude] account rebound by reconcile; starting fresh without transferring history",
@@ -1538,7 +1581,8 @@ async function handleChatCompletions(
         account: account.id,
         transcriptChars: transcript.length,
         approxTokens: Math.round(transcript.length / 4),
-        cap: historyMaxChars(),
+        cap: deliberateSwitch ? "none (deliberate switch)" : historyMaxChars(),
+        deliberate: deliberateSwitch,
       });
     }
   }

@@ -264,9 +264,17 @@ export function buildAccountTools(): Record<string, ToolDefinition> {
               );
             }
             const previous = getBoundAccountId(context.sessionID);
-            bindConversationAccount(context.sessionID, account.id, account.label);
+            // Calling this tool IS the operator asking, so the history follows
+            // in full. Between 2026-08-20 and this change it did not, while
+            // this very message kept promising it would.
+            bindConversationAccount(
+              context.sessionID,
+              account.id,
+              account.label,
+              { deliberate: true },
+            );
             return previous && previous !== account.id
-              ? `This session now runs on ${account.label} (${account.id}), moved from ${previous}. The Claude transcript does not follow across accounts, so the conversation is carried over as context on the next turn.`
+              ? `This session now runs on ${account.label} (${account.id}), moved from ${previous}. The Claude transcript does not follow across accounts, so the whole conversation is re-sent as context on the next turn — that turn is a large one, every turn after it is normal.`
               : `This session now runs on ${account.label} (${account.id}).`;
           }
           case "add": {

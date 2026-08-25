@@ -310,6 +310,23 @@ async function main() {
     // system prompt never leaks into the transfer
     assert.doesNotMatch(transcript, /huge internal system prompt/);
 
+    // A deliberate switch transfers the whole conversation: OpenCode already
+    // sent it in this request, and an unbounded budget is what makes changing
+    // account as lossless as changing provider.
+    const wholeThing = buildConversationTranscript(
+      prior,
+      Number.POSITIVE_INFINITY,
+    );
+    assert.doesNotMatch(
+      wholeThing,
+      /earlier message\(s\) omitted/,
+      "an infinite budget drops nothing",
+    );
+    assert.ok(
+      buildConversationTranscript(prior, 80).length <= 200,
+      "a finite budget still bounds the transfer",
+    );
+
     // tool calls/results are condensed but present
     const withTools = buildConversationTranscript([
       { role: "user", content: "run tests" },
@@ -1671,9 +1688,41 @@ async function main() {
         "and the resume target does not follow across accounts",
       );
 
+      // `rebound` is the flag that suppresses the history transfer, and only
+      // machinery may set it. An unasked-for move marks it; a move the operator
+      // made in a live session does not, and overrules one left behind.
+      bindConversationAccount("ses_reb", "work", "Work");
+      bindConversationAccount("ses_reb", "personal", "Personal");
+      assert.equal(
+        getSessionBinding("ses_reb")?.rebound,
+        true,
+        "an unrequested move is machinery: the next turn must not pay to follow",
+      );
+      bindConversationAccount("ses_reb", "work", "Work", { deliberate: true });
+      assert.equal(
+        getSessionBinding("ses_reb")?.rebound,
+        undefined,
+        "asking for this account is a later, stronger statement than the sweep",
+      );
+
+      bindConversationAccount("ses_del", "work", "Work");
+      bindConversationAccount("ses_del", "personal", "Personal", {
+        deliberate: true,
+      });
+      assert.equal(
+        getSessionBinding("ses_del")?.rebound,
+        undefined,
+        "a deliberate switch never marks rebound",
+      );
+      assert.equal(
+        getForeignSessionId("ses_del"),
+        undefined,
+        "but the resume target still does not cross accounts",
+      );
+
       bindConversationAccount("ses_b", "work", "Work");
       const bindings = listSessionBindings();
-      assert.equal(bindings.length, 3);
+      assert.equal(bindings.length, 5);
       assert.ok(bindings.every((b) => typeof b.accountId === "string"));
     } finally {
       if (prevXdg === undefined) delete process.env.XDG_DATA_HOME;
