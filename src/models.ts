@@ -46,6 +46,9 @@ export type ModelCost = {
  * Set OPENCODE_CLAUDE_MODEL_COST=0 to publish nothing and go back to zeros.
  */
 const API_PRICING: Record<string, { input: number; output: number }> = {
+  // Fable 5.1 has no separately published rate; it is a point release of
+  // Fable 5 and carries its list price until Anthropic says otherwise.
+  "Fable 5.1": { input: 10, output: 50 },
   "Fable 5": { input: 10, output: 50 },
   "Opus 5": { input: 5, output: 25 },
   "Opus 4.8": { input: 5, output: 25 },
@@ -115,7 +118,21 @@ const ALIAS_MODELS: ClaudeModel[] = [
   model("haiku", "Haiku 4.5", LIMIT_200K, "claude-haiku-4-5"),
 ];
 
+/**
+ * Explicit version ids. Mostly the previous generation, but also anything the
+ * installed CLI's alias table has not caught up with yet — as of Claude Code
+ * 2.1.252 that table still reads `["fable",[5]]`, so `fable` serves Fable 5 and
+ * 5.1 is only reachable by pinning it.
+ *
+ * The `[1m]` on the resolved id is not decoration. An id the CLI does not
+ * recognize is assumed to be a 200k model and auto-compacted at 200k, which
+ * with a 1M context declared here is the one actively broken combination:
+ * OpenCode would budget a window the CLI is already truncating. The suffix is
+ * the CLI's own escape hatch and it answers `contextWindow: 1000000` while
+ * still billing the turn as canonical `claude-fable-5-1`.
+ */
 const PINNED_MODELS: ClaudeModel[] = [
+  model("claude-fable-5-1", "Fable 5.1", LIMIT_1M, "claude-fable-5-1[1m]"),
   model("claude-opus-4-8", "Opus 4.8", LIMIT_1M),
   model("claude-sonnet-4-6", "Sonnet 4.6", LIMIT_1M),
   model("claude-haiku-4-5", "Haiku 4.5", LIMIT_200K),
