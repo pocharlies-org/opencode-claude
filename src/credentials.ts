@@ -63,6 +63,12 @@ export function extractClaudeOAuthCredentials(
       : null) ||
     (root.claude_ai_oauth && typeof root.claude_ai_oauth === "object"
       ? (root.claude_ai_oauth as Record<string, unknown>)
+      : null) ||
+    // A bare OAuth block (no claudeAiOauth wrapper) is still Claude Code's
+    // own on-disk shape — a hand-repaired file must not read as "not
+    // connected".
+    (typeof root.accessToken === "string" || typeof root.access_token === "string"
+      ? root
       : null);
   if (!block) return null;
   return extractFromBlock(block);
