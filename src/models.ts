@@ -15,6 +15,10 @@ import {
 } from "./accounts.js";
 import { formatShortDuration, getAccountQuota } from "./quota.js";
 import { getRateLimitSnapshot } from "./rate-limit.js";
+import {
+  readCatalogOverlay,
+  type CatalogOverlayEntry,
+} from "./catalog-file.js";
 
 export type ClaudeModel = {
   id: string;
@@ -151,7 +155,84 @@ function buildCatalog(): ClaudeModel[] {
   return [...ALIAS_MODELS, ...visiblePins];
 }
 
-export const CLAUDE_CODE_MODELS: ClaudeModel[] = buildCatalog();
+/** Cache rates are multipliers on the input rate, wherever the rate came from. */
+function costFromRates(input: number, output: number): ModelCost | undefined {
+  if (modelCostDisabled()) return undefined;
+  return {
+    input,
+    output,
+    cache: {
+      read: Number((input * CACHE_READ_MULTIPLIER).toFixed(4)),
+      write: Number((input * CACHE_WRITE_MULTIPLIER).toFixed(4)),
+    },
+  };
+}
+
+/**
+ * A new model declared only in the overlay needs a window, and the file is not
+ * required to give one. Default DOWN, never up: declaring more context than
+ * the model has is the one actively broken direction — the host budgets a
+ * window the CLI is already auto-compacting underneath it. Declaring less just
+ * leaves capacity unused, which is visible and harmless.
+ */
+const OVERLAY_DEFAULT_LIMIT = LIMIT_200K;
+
+function applyOverlay(
+  base: ClaudeModel[],
+  entries: CatalogOverlayEntry[],
+): ClaudeModel[] {
+  if (!entries.length) return base;
+
+  const order: string[] = base.map((m) => m.id);
+  const byId = new Map<string, ClaudeModel>(base.map((m) => [m.id, m]));
+
+  for (const entry of entries) {
+    if (entry.hidden) {
+      byId.delete(entry.id);
+      continue;
+    }
+    const existing = byId.get(entry.id);
+    const name = entry.name ?? existing?.name ?? entry.id;
+    const cost = entry.cost
+      ? costFromRates(entry.cost.input, entry.cost.output)
+      : (costFor(name) ?? existing?.cost);
+    const resolvedId = entry.resolvedId ?? existing?.resolvedId;
+    const merged: ClaudeModel = {
+      id: entry.id,
+      name,
+      reasoning: entry.reasoning ?? existing?.reasoning ?? true,
+      contextWindow:
+        entry.contextWindow ??
+        existing?.contextWindow ??
+        OVERLAY_DEFAULT_LIMIT.context,
+      maxTokens:
+        entry.maxTokens ?? existing?.maxTokens ?? OVERLAY_DEFAULT_LIMIT.output,
+      ...(resolvedId ? { resolvedId } : {}),
+      ...(cost ? { cost } : {}),
+    };
+    if (!existing) order.push(entry.id);
+    byId.set(entry.id, merged);
+  }
+
+  return order
+    .map((id) => byId.get(id))
+    .filter((m): m is ClaudeModel => m !== undefined);
+}
+
+/**
+ * The catalog as it stands RIGHT NOW: shipped models plus whatever the overlay
+ * file says today.
+ *
+ * Deliberately a function and not the module-level constant it used to be. A
+ * constant is captured once when the module is first imported, and OpenCode
+ * imports a plugin exactly once per process — so a constant could only ever
+ * change by restarting the host, which is the thing this is here to avoid.
+ * See `catalog-file.ts`.
+ */
+export function getCatalog(): ClaudeModel[] {
+  return applyOverlay(buildCatalog(), readCatalogOverlay());
+}
+
 
 /** Placeholder so OpenCode keeps the provider visible while logged out. */
 export const LOGIN_PLACEHOLDER_MODELS: ClaudeModel[] = [
@@ -289,12 +370,15 @@ function nameQuotaDisabled(): boolean {
 }
 
 export function getClaudeModels(): ClaudeModel[] {
+  // Read the catalog ONCE per build: it stats the overlay file, and the
+  // multi-account branch would otherwise repeat that per account.
+  const catalog = getCatalog();
   if (!isMultiAccount()) {
     // Single account: no label to add, but the remaining quota is just as
     // useful — it is the same question, asked of the only subscription there is.
     const suffix = quotaNameSuffix(getDefaultAccount().id);
-    if (!suffix) return CLAUDE_CODE_MODELS;
-    return CLAUDE_CODE_MODELS.map((model) => ({
+    if (!suffix) return catalog;
+    return catalog.map((model) => ({
       ...model,
       name: `${model.name}${suffix}`,
     }));
@@ -303,7 +387,7 @@ export function getClaudeModels(): ClaudeModel[] {
   return getAccounts().flatMap((account) => {
     const suffix = quotaNameSuffix(account.id);
     const icon = icons.get(account.id);
-    return CLAUDE_CODE_MODELS.map((model) => ({
+    return catalog.map((model) => ({
       ...model,
       id: composeAccountModelId(model.id, account),
       name: `${icon ? `${icon} ` : ""}${model.name}${suffix}`,
@@ -323,7 +407,7 @@ export function getClaudeModels(): ClaudeModel[] {
 export function getClaudeModelsForAccount(account: ClaudeAccount): ClaudeModel[] {
   const suffix = quotaNameSuffix(account.id);
   const icon = isMultiAccount() ? accountIcons().get(account.id) : undefined;
-  return CLAUDE_CODE_MODELS.map((model) => ({
+  return getCatalog().map((model) => ({
     ...model,
     name: `${icon ? `${icon} ` : ""}${model.name}${suffix}`,
   }));
@@ -331,7 +415,7 @@ export function getClaudeModelsForAccount(account: ClaudeAccount): ClaudeModel[]
 
 export function resolveClaudeModelId(modelId: string): string {
   const { baseModelId } = parseAccountModelId(modelId);
-  const match = CLAUDE_CODE_MODELS.find((m) => m.id === baseModelId);
+  const match = getCatalog().find((m) => m.id === baseModelId);
   if (!match) return baseModelId || modelId;
   return match.resolvedId || match.id;
 }

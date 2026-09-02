@@ -49,7 +49,7 @@ async function main() {
     interpretClaudeAuthStatus,
   } = await import("../src/detect.ts");
   const {
-    CLAUDE_CODE_MODELS,
+    getCatalog,
     buildEffortVariants,
     getClaudeModels,
     isLoginPlaceholderModel,
@@ -152,7 +152,7 @@ async function main() {
   assert.equal(isLoginPlaceholderModel("login"), true);
   assert.equal(isLoginPlaceholderModel("sonnet"), false);
 
-  const sonnet = CLAUDE_CODE_MODELS.find((m) => m.id === "sonnet")!;
+  const sonnet = getCatalog().find((m) => m.id === "sonnet")!;
   const variants = buildEffortVariants(sonnet);
   for (const level of EFFORT_LEVELS) {
     assert.ok(variants[level]);
@@ -1426,7 +1426,7 @@ async function main() {
     assert.equal(getAccounts().length, 1);
     assert.deepEqual(
       accountModels().map((m) => m.id),
-      CLAUDE_CODE_MODELS.map((m) => m.id),
+      getCatalog().map((m) => m.id),
       "single-account catalog is byte-identical to the plain one",
     );
     assert.equal(withAccountTitleTag("Fix the proxy", getDefaultAccount()),
@@ -1582,7 +1582,7 @@ async function main() {
     // A per-account provider carries plain model ids: no suffix needed.
     assert.deepEqual(
       getClaudeModelsForAccount(resolveAccount("personal")).map((m) => m.id),
-      CLAUDE_CODE_MODELS.map((m) => m.id),
+      getCatalog().map((m) => m.id),
     );
 
     assert.deepEqual(parseAccountModelId("opus@personal"), {
@@ -2049,6 +2049,134 @@ async function main() {
           }
           // A model nobody published a price for stays unpriced, not wrong.
           assert.equal(costFor("Not A Model"), undefined);
+        }
+
+        // ---- Operator-editable catalog overlay (models.json) ----
+        // The point of the overlay is that a new model does NOT need a plugin
+        // rebuild or a host restart, so what these assert is mostly damage
+        // control: the shipped catalog has to survive every way an operator
+        // can get the file wrong.
+        {
+          const { getCatalog, resolveClaudeModelId: resolveOverlay } = await import(
+            "../src/models.ts"
+          );
+          const { mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
+          const { tmpdir } = await import("node:os");
+          const { join } = await import("node:path");
+
+          const dir = mkdtempSync(join(tmpdir(), "oc-claude-models-"));
+          const file = join(dir, "models.json");
+          const previous = process.env.OPENCODE_CLAUDE_MODELS_FILE;
+          const ids = () => getCatalog().map((m) => m.id);
+
+          try {
+            // A path that does not exist is the default state, not an error.
+            process.env.OPENCODE_CLAUDE_MODELS_FILE = join(dir, "absent.json");
+            const shipped = ids();
+            assert.ok(shipped.includes("opus"), "shipped catalog without a file");
+
+            process.env.OPENCODE_CLAUDE_MODELS_FILE = file;
+
+            // A new id is appended, and {input,output} grows the same cache
+            // multipliers the built-in price table uses.
+            writeFileSync(
+              file,
+              JSON.stringify({
+                models: [
+                  {
+                    id: "claude-test-1",
+                    name: "Test 1",
+                    contextWindow: 1_000_000,
+                    maxTokens: 128_000,
+                    resolvedId: "claude-test-1[1m]",
+                    cost: { input: 10, output: 50 },
+                  },
+                ],
+              }),
+            );
+            const added = getCatalog().find((m) => m.id === "claude-test-1")!;
+            assert.ok(added, "overlay adds a model");
+            assert.equal(added.contextWindow, 1_000_000);
+            assert.deepEqual(added.cost, {
+              input: 10,
+              output: 50,
+              cache: { read: 1, write: 12.5 },
+            });
+            assert.equal(resolveOverlay("claude-test-1"), "claude-test-1[1m]");
+
+            // Matching a shipped id edits in place: fields the file does not
+            // mention are kept, and the catalog order does not move.
+            writeFileSync(
+              file,
+              JSON.stringify({ models: [{ id: "opus", contextWindow: 200_000 }] }),
+            );
+            const opusOverlay = getCatalog().find((m) => m.id === "opus")!;
+            assert.equal(opusOverlay.contextWindow, 200_000);
+            assert.equal(opusOverlay.name, "Opus 5", "keeps the shipped name");
+            assert.deepEqual(ids(), shipped, "an in-place edit does not reorder");
+
+            writeFileSync(
+              file,
+              JSON.stringify({ models: [{ id: "opus", hidden: true }] }),
+            );
+            assert.ok(!ids().includes("opus"), "hidden drops a model");
+
+            // An id with no declared window defaults DOWN. Declaring more
+            // context than the model has is the actively broken direction:
+            // the host budgets a window the CLI is already compacting.
+            writeFileSync(
+              file,
+              JSON.stringify({ models: [{ id: "claude-test-2", name: "Test 2" }] }),
+            );
+            const bare = getCatalog().find((m) => m.id === "claude-test-2")!;
+            assert.equal(bare.contextWindow, 200_000, "defaults down, never up");
+            assert.equal(bare.maxTokens, 64_000);
+
+            // Everything below must degrade to the shipped catalog. A stray
+            // comma emptying the model picker would be a worse deal than the
+            // restart this whole mechanism exists to avoid.
+            writeFileSync(file, "{ not json,,,");
+            assert.deepEqual(ids(), shipped, "a broken file changes nothing");
+
+            writeFileSync(file, JSON.stringify({ models: "not an array" }));
+            assert.deepEqual(ids(), shipped, "a wrong shape changes nothing");
+
+            writeFileSync(file, JSON.stringify({}));
+            assert.deepEqual(ids(), shipped, "a file with no models key");
+
+            // One unusable entry must not take the usable ones with it.
+            writeFileSync(
+              file,
+              JSON.stringify({
+                models: [
+                  { name: "no id at all" },
+                  42,
+                  { id: "claude-test-3", name: "Test 3" },
+                ],
+              }),
+            );
+            assert.ok(ids().includes("claude-test-3"), "good entries still load");
+            assert.equal(ids().length, shipped.length + 1);
+
+            // The whole point: two edits in a row, same process, same imported
+            // module, no restart. An earlier version cached on mtime+size and
+            // silently missed same-length edits like 5-1 -> 5-2.
+            writeFileSync(
+              file,
+              JSON.stringify({ models: [{ id: "claude-test-a1", name: "A1" }] }),
+            );
+            assert.ok(ids().includes("claude-test-a1"));
+            writeFileSync(
+              file,
+              JSON.stringify({ models: [{ id: "claude-test-a2", name: "A2" }] }),
+            );
+            assert.ok(ids().includes("claude-test-a2"), "same-length edit is seen");
+            assert.ok(!ids().includes("claude-test-a1"), "and the old one is gone");
+          } finally {
+            if (previous === undefined) delete process.env.OPENCODE_CLAUDE_MODELS_FILE;
+            else process.env.OPENCODE_CLAUDE_MODELS_FILE = previous;
+            rmSync(dir, { recursive: true, force: true });
+          }
         }
 
         // ---- Plan usage over the SDK control channel (`get_usage`) ----
