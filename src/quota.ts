@@ -23,11 +23,14 @@
  *
  * Store: $XDG_DATA_HOME/opencode-claude/quota.json
  */
+import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { accountConfigDir, type ClaudeAccount } from "./accounts.js";
+import { accountConfigDir, applyAccountEnv, type ClaudeAccount } from "./accounts.js";
+import { buildClaudeCodeChildEnv } from "./auth-env.js";
 import { readClaudeCliOAuthCredentials } from "./credentials.js";
+import { resolveClaudeCodeExecutable } from "./executable-path.js";
 import { log } from "./log.js";
 
 export type QuotaWindow = {
@@ -459,6 +462,85 @@ export function getAllAccountQuota(): Record<string, AccountQuota> {
  * cheapest way to ask. Costs ~20 input tokens against the very window it
  * measures, which is why nothing calls this on a timer.
  */
+/**
+ * Refresh an expired access token by spawning the CLI that OWNS the account's
+ * refresh chain, with the same single-flight discipline as index.ts: two
+ * rotations of one token make Anthropic revoke the whole grant (auth-login.ts,
+ * burned 2026-08-11), so per account at most one CLI runs at a time and the
+ * result is shared. The CLI is spawned WITHOUT CLAUDE_CODE_OAUTH_TOKEN — that
+ * env var would hand it the stale token and skip the credentials-file refresh.
+ *
+ * Only the panel's explicit quota refresh may call this. It costs a real CLI
+ * boot (~2s and a tiny amount of inference) and is operator-initiated, never
+ * on a timer and never on the request path.
+ */
+const cliRefreshInFlight = new Map<string, Promise<boolean>>();
+
+export function refreshAccountTokenViaCli(
+  account: ClaudeAccount,
+): Promise<boolean> {
+  const running = cliRefreshInFlight.get(account.id);
+  if (running) return running;
+  const run = (async () => {
+    const bin = resolveClaudeCodeExecutable();
+    if (!bin) {
+      log.warn("[opencode-claude] token refresh: no claude binary found", {
+        account: account.id,
+      });
+      return false;
+    }
+    const env = applyAccountEnv(
+      account,
+      buildClaudeCodeChildEnv(process.env) as Record<string, string | undefined>,
+    );
+    // A minimal authenticated turn; the CLI rotates its own credentials file.
+    // No cwd: the account's project settings must not decide what it may read.
+    const child = spawn(
+      bin,
+      ["-p", "hi", "--model", "claude-haiku-4-5", "--tools", ""],
+      { env: env as NodeJS.ProcessEnv, stdio: ["ignore", "ignore", "pipe"], windowsHide: true },
+    );
+    let stderr = "";
+    child.stderr?.on("data", (chunk) => {
+      stderr = (stderr + chunk.toString()).slice(-2000);
+    });
+    const exited = await new Promise<boolean>((resolve) => {
+      const kill = setTimeout(() => child.kill("SIGKILL"), 90_000);
+      child.on("error", (err) => {
+        clearTimeout(kill);
+        log.warn("[opencode-claude] token refresh spawn failed", {
+          account: account.id,
+          message: String(err),
+        });
+        resolve(false);
+      });
+      child.on("exit", (code) => {
+        clearTimeout(kill);
+        if (code !== 0) {
+          log.warn("[opencode-claude] token refresh CLI exited nonzero", {
+            account: account.id,
+            code,
+            stderr: stderr.slice(0, 300),
+          });
+        }
+        resolve(code === 0);
+      });
+    });
+    if (!exited) return false;
+    const creds = readClaudeCliOAuthCredentials(
+      account.configDir ? { configDir: account.configDir } : undefined,
+    );
+    const alive = !!creds?.accessToken && !!creds.expiresAt && creds.expiresAt > Date.now() + 30_000;
+    log.info("[opencode-claude] token refreshed via CLI", {
+      account: account.id,
+      alive,
+    });
+    return alive;
+  })().finally(() => cliRefreshInFlight.delete(account.id));
+  cliRefreshInFlight.set(account.id, run);
+  return run;
+}
+
 export async function probeAccountQuota(
   account: ClaudeAccount,
   options?: { signal?: AbortSignal },
@@ -472,11 +554,53 @@ export async function probeAccountQuota(
     );
   }
 
-  const response = await fetch(ANTHROPIC_MESSAGES_URL, {
+  const response = await fetchProbe(creds.accessToken, options);
+
+  // A 429 still carries the headers, and they are exactly what we want then.
+  let parsed = recordQuotaFromHeaders(account.id, response.headers, "probe");
+  if (
+    !parsed &&
+    response.status === 401 &&
+    account.configDir &&
+    (await refreshAccountTokenViaCli(account))
+  ) {
+    // The stored access token had expired. The CLI that owns this account's
+    // refresh chain renewed its own credentials file (the proxy must never
+    // rotate it — two owners get the grant revoked, see auth-login.ts).
+    // Retry the probe once with the fresh token.
+    const fresh = readClaudeCliOAuthCredentials(
+      account.configDir ? { configDir: account.configDir } : undefined,
+    );
+    if (fresh?.accessToken) {
+      const retry = await fetchProbe(fresh.accessToken, options);
+      parsed = recordQuotaFromHeaders(account.id, retry.headers, "probe");
+    }
+  }
+  if (!parsed) {
+    const text = await response.text().catch(() => "");
+    throw new Error(
+      response.ok
+        ? "Anthropic returned no rate-limit headers for this token"
+        : `quota probe failed (HTTP ${response.status}): ${text.slice(0, 200)}`,
+    );
+  }
+  log.info("[opencode-claude] quota probed", {
+    account: account.id,
+    fiveHour: parsed.windows.fiveHour?.utilization,
+    sevenDay: parsed.windows.sevenDay?.utilization,
+  });
+  return parsed;
+}
+
+async function fetchProbe(
+  accessToken: string,
+  options?: { signal?: AbortSignal },
+): Promise<Response> {
+  return fetch(ANTHROPIC_MESSAGES_URL, {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      authorization: `Bearer ${creds.accessToken}`,
+      authorization: `Bearer ${accessToken}`,
       "anthropic-version": "2023-06-01",
       "anthropic-beta": "oauth-2025-04-20",
       "anthropic-dangerous-direct-browser-access": "true",
@@ -495,23 +619,6 @@ export async function probeAccountQuota(
     }),
     signal: options?.signal ?? AbortSignal.timeout(20_000),
   });
-
-  // A 429 still carries the headers, and they are exactly what we want then.
-  const parsed = recordQuotaFromHeaders(account.id, response.headers, "probe");
-  if (!parsed) {
-    const text = await response.text().catch(() => "");
-    throw new Error(
-      response.ok
-        ? "Anthropic returned no rate-limit headers for this token"
-        : `quota probe failed (HTTP ${response.status}): ${text.slice(0, 200)}`,
-    );
-  }
-  log.info("[opencode-claude] quota probed", {
-    account: account.id,
-    fiveHour: parsed.windows.fiveHour?.utilization,
-    sevenDay: parsed.windows.sevenDay?.utilization,
-  });
-  return parsed;
 }
 
 /** Test helper. */
