@@ -67,7 +67,22 @@ export type AccountQuota = {
   source: "headers" | "probe" | "plan-usage";
 };
 
-type QuotaStore = { version: 1; accounts: Record<string, AccountQuota> };
+/**
+ * Why the last refresh for an account failed. SC-51: a missing `claude`
+ * binary silently killed token refresh for days (Promise.allSettled swallowed
+ * it, quota.json stopped updating, the panel showed old data as if fresh).
+ * The failure is now recorded here and surfaced wherever quota is read.
+ */
+export type QuotaRefreshError = {
+  message: string;
+  at: number;
+};
+
+type QuotaStore = {
+  version: 1;
+  accounts: Record<string, AccountQuota>;
+  refreshErrors: Record<string, QuotaRefreshError>;
+};
 
 const ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages";
 const PREFIX = "anthropic-ratelimit-unified-";
@@ -87,19 +102,24 @@ function storePath(): string {
 
 function readStore(): QuotaStore {
   const path = storePath();
-  if (!existsSync(path)) return { version: 1, accounts: {} };
+  if (!existsSync(path)) return { version: 1, accounts: {}, refreshErrors: {} };
   try {
     const parsed = JSON.parse(readFileSync(path, "utf8"));
     const accounts = (parsed as { accounts?: unknown })?.accounts;
+    const refreshErrors = (parsed as { refreshErrors?: unknown })?.refreshErrors;
     return {
       version: 1,
       accounts:
         accounts && typeof accounts === "object"
           ? (accounts as Record<string, AccountQuota>)
           : {},
+      refreshErrors:
+        refreshErrors && typeof refreshErrors === "object"
+          ? (refreshErrors as Record<string, QuotaRefreshError>)
+          : {},
     };
   } catch {
-    return { version: 1, accounts: {} };
+    return { version: 1, accounts: {}, refreshErrors: {} };
   }
 }
 
@@ -436,15 +456,19 @@ export function formatShortDuration(ms: number): string {
 export function renameAccountQuota(oldId: string, newId: string): void {
   const store = readStore();
   const entry = store.accounts[normalizeKey(oldId)];
-  if (!entry) return;
+  const error = store.refreshErrors[normalizeKey(oldId)];
+  if (!entry && !error) return;
   delete store.accounts[normalizeKey(oldId)];
-  store.accounts[normalizeKey(newId)] = entry;
+  delete store.refreshErrors[normalizeKey(oldId)];
+  if (entry) store.accounts[normalizeKey(newId)] = entry;
+  if (error) store.refreshErrors[normalizeKey(newId)] = error;
   writeStore(store);
 }
 
 export function clearAccountQuota(accountId: string): void {
   const store = readStore();
   delete store.accounts[normalizeKey(accountId)];
+  delete store.refreshErrors[normalizeKey(accountId)];
   writeStore(store);
 }
 
@@ -454,6 +478,39 @@ export function getAccountQuota(accountId?: string): AccountQuota | null {
 
 export function getAllAccountQuota(): Record<string, AccountQuota> {
   return readStore().accounts;
+}
+
+/**
+ * Record why the last quota/token refresh for an account failed. Never
+ * swallowed: the panel and `/v1/quota` expose it, and a later success clears
+ * it. This is the SC-51 fix — the failure mode was a refresh that died
+ * silently while the store aged.
+ */
+export function recordQuotaRefreshError(
+  accountId: string | undefined,
+  message: string,
+  now: number = Date.now(),
+): void {
+  const store = readStore();
+  store.refreshErrors[normalizeKey(accountId)] = { message: message.slice(0, 500), at: now };
+  writeStore(store);
+}
+
+export function getQuotaRefreshError(accountId?: string): QuotaRefreshError | null {
+  return readStore().refreshErrors[normalizeKey(accountId)] ?? null;
+}
+
+export function getAllQuotaRefreshErrors(): Record<string, QuotaRefreshError> {
+  return readStore().refreshErrors;
+}
+
+/** A successful refresh retires the error; the data is fresh again. */
+export function clearQuotaRefreshError(accountId?: string): void {
+  const key = normalizeKey(accountId);
+  const store = readStore();
+  if (!store.refreshErrors[key]) return;
+  delete store.refreshErrors[key];
+  writeStore(store);
 }
 
 /**
@@ -484,9 +541,13 @@ export function refreshAccountTokenViaCli(
   const run = (async () => {
     const bin = resolveClaudeCodeExecutable();
     if (!bin) {
-      log.warn("[opencode-claude] token refresh: no claude binary found", {
-        account: account.id,
-      });
+      // SC-51: this was the silent one — a service PATH without
+      // ~/.local/bin, warn-level, swallowed by Promise.allSettled upstream,
+      // and the quota store aged for days. Error-level AND recorded.
+      const message =
+        "token refresh: no claude binary found (searched PATH and known install locations)";
+      log.error("[opencode-claude] token refresh failed", `${message} account=${account.id}`);
+      recordQuotaRefreshError(account.id, message);
       return false;
     }
     const env = applyAccountEnv(
@@ -508,20 +569,24 @@ export function refreshAccountTokenViaCli(
       const kill = setTimeout(() => child.kill("SIGKILL"), 90_000);
       child.on("error", (err) => {
         clearTimeout(kill);
-        log.warn("[opencode-claude] token refresh spawn failed", {
-          account: account.id,
-          message: String(err),
-        });
+        log.error(
+          "[opencode-claude] token refresh spawn failed",
+          `account=${account.id} ${String(err)}`,
+        );
+        recordQuotaRefreshError(account.id, `token refresh spawn failed: ${String(err)}`);
         resolve(false);
       });
       child.on("exit", (code) => {
         clearTimeout(kill);
         if (code !== 0) {
-          log.warn("[opencode-claude] token refresh CLI exited nonzero", {
-            account: account.id,
-            code,
-            stderr: stderr.slice(0, 300),
-          });
+          log.error(
+            "[opencode-claude] token refresh CLI exited nonzero",
+            `account=${account.id} code=${String(code)} stderr=${stderr.slice(0, 300)}`,
+          );
+          recordQuotaRefreshError(
+            account.id,
+            `token refresh CLI exited ${String(code)}: ${stderr.slice(0, 200)}`,
+          );
         }
         resolve(code === 0);
       });
@@ -531,6 +596,11 @@ export function refreshAccountTokenViaCli(
       account.configDir ? { configDir: account.configDir } : undefined,
     );
     const alive = !!creds?.accessToken && !!creds.expiresAt && creds.expiresAt > Date.now() + 30_000;
+    if (!alive) {
+      const message = "token refresh CLI ran but credentials are still expired";
+      log.error("[opencode-claude] token refresh failed", `${message} account=${account.id}`);
+      recordQuotaRefreshError(account.id, message);
+    }
     log.info("[opencode-claude] token refreshed via CLI", {
       account: account.id,
       alive,
@@ -578,12 +648,14 @@ export async function probeAccountQuota(
   }
   if (!parsed) {
     const text = await response.text().catch(() => "");
-    throw new Error(
-      response.ok
-        ? "Anthropic returned no rate-limit headers for this token"
-        : `quota probe failed (HTTP ${response.status}): ${text.slice(0, 200)}`,
-    );
+    const message = response.ok
+      ? "Anthropic returned no rate-limit headers for this token"
+      : `quota probe failed (HTTP ${response.status}): ${text.slice(0, 200)}`;
+    log.error("[opencode-claude] quota probe failed", `${message} account=${account.id}`);
+    recordQuotaRefreshError(account.id, message);
+    throw new Error(message);
   }
+  clearQuotaRefreshError(account.id);
   log.info("[opencode-claude] quota probed", {
     account: account.id,
     fiveHour: parsed.windows.fiveHour?.utilization,
@@ -623,5 +695,5 @@ async function fetchProbe(
 
 /** Test helper. */
 export function __resetQuotaStore(): void {
-  writeStore({ version: 1, accounts: {} });
+  writeStore({ version: 1, accounts: {}, refreshErrors: {} });
 }

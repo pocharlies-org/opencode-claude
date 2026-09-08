@@ -2639,6 +2639,102 @@ async function main() {
       }
     }
 
+    // ---- SC-51: claude found off-PATH, and refresh failures stay visible ----
+    {
+      const sc51Dir = mkdtempSync(joinPath(tmpdir(), "oc-claude-sc51-"));
+      const prevQuota51 = process.env.OPENCODE_CLAUDE_QUOTA_STORE;
+      process.env.OPENCODE_CLAUDE_QUOTA_STORE = joinPath(sc51Dir, "quota.json");
+      const prevPath51 = process.env.PATH;
+      const prevHome51 = process.env.HOME;
+      try {
+        const {
+          resolveClaudeCodeExecutable,
+          resetClaudeCliResolutionCache,
+        } = await import("../src/executable-path.ts");
+        const {
+          recordQuotaRefreshError,
+          getQuotaRefreshError,
+          clearQuotaRefreshError,
+          refreshAccountTokenViaCli,
+          __resetQuotaStore,
+        } = await import("../src/quota.ts");
+        __resetQuotaStore();
+
+        // (a) A service PATH that misses the installer location must still
+        // find claude in ~/.local/bin — the exact SC-51 failure: the systemd
+        // unit's PATH had no ~/.local/bin, refresh died, the store aged.
+        const fakeHome = joinPath(sc51Dir, "home");
+        mkdirSync(joinPath(fakeHome, ".local", "bin"), { recursive: true });
+        const fakeBin = joinPath(fakeHome, ".local", "bin", "claude");
+        writeFileSync(fakeBin, "#!/bin/sh\necho 'claude fake 9.9.9'\n", {
+          mode: 0o755,
+        });
+        resetClaudeCliResolutionCache();
+        assert.equal(
+          resolveClaudeCodeExecutable({ env: { PATH: "", HOME: fakeHome } }),
+          fakeBin,
+          "known install location is probed after PATH",
+        );
+
+        // Nowhere to find it: null, not a guess.
+        resetClaudeCliResolutionCache();
+        assert.equal(
+          resolveClaudeCodeExecutable({
+            env: { PATH: "", HOME: joinPath(sc51Dir, "empty-home") },
+          }),
+          null,
+        );
+
+        // (b) Expired token + binary not on PATH: the failure is RECORDED and
+        // readable by the panel, never swallowed by Promise.allSettled again.
+        __resetQuotaStore();
+        process.env.PATH = "";
+        process.env.HOME = joinPath(sc51Dir, "empty-home");
+        resetClaudeCliResolutionCache();
+        const refreshed = await refreshAccountTokenViaCli({
+          id: "sc51-expired",
+          label: "SC51",
+          configDir: joinPath(sc51Dir, "cfg"),
+        });
+        assert.equal(refreshed, false);
+        const err = getQuotaRefreshError("sc51-expired");
+        assert.ok(err, "the refresh failure is visible in the store");
+        assert.match(err.message, /no claude binary found/);
+        assert.ok(err.at > 0, "the failure carries a timestamp");
+
+        // A later success retires it — the panel shows the error only while
+        // the data is actually unhealthy.
+        clearQuotaRefreshError("sc51-expired");
+        assert.equal(getQuotaRefreshError("sc51-expired"), null);
+
+        // Rename carries the error with the account; disconnect drops it.
+        recordQuotaRefreshError("sc51-old", "boom");
+        const { renameAccountQuota, clearAccountQuota } = await import(
+          "../src/quota.ts"
+        );
+        renameAccountQuota("sc51-old", "sc51-new");
+        assert.match(getQuotaRefreshError("sc51-new")?.message ?? "", /boom/);
+        assert.equal(getQuotaRefreshError("sc51-old"), null);
+        clearAccountQuota("sc51-new");
+        assert.equal(getQuotaRefreshError("sc51-new"), null);
+      } finally {
+        if (prevPath51 === undefined) delete process.env.PATH;
+        else process.env.PATH = prevPath51;
+        if (prevHome51 === undefined) delete process.env.HOME;
+        else process.env.HOME = prevHome51;
+        const { resetClaudeCliResolutionCache } = await import(
+          "../src/executable-path.ts"
+        );
+        resetClaudeCliResolutionCache();
+        if (prevQuota51 === undefined) {
+          delete process.env.OPENCODE_CLAUDE_QUOTA_STORE;
+        } else {
+          process.env.OPENCODE_CLAUDE_QUOTA_STORE = prevQuota51;
+        }
+        rmSync(sc51Dir, { recursive: true, force: true });
+      }
+    }
+
     // ---- Panel: account CRUD, OAuth handoff, usage, CSRF ----
     {
       const panelDir = mkdtempSync(joinPath(tmpdir(), "oc-claude-panel-"));

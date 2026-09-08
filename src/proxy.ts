@@ -77,9 +77,12 @@ import {
   formatQuotaSummary,
   getAccountQuota,
   getAllAccountQuota,
+  getAllQuotaRefreshErrors,
+  getQuotaRefreshError,
   mergeSdkRateLimitEvent,
   probeAccountQuota,
   recordQuotaFromPlanUsage,
+  recordQuotaRefreshError,
   renameAccountQuota,
 } from "./quota.js";
 import {
@@ -579,6 +582,14 @@ function describeAccount(
     rateLimit: getRateLimitSnapshot(Date.now(), account.id),
     usage: getAccountUsage(account.id),
     quota: getAccountQuota(account.id),
+    // SC-51: quota data that stopped updating is not healthy data. The age
+    // and the last refresh failure travel with the numbers so the panel can
+    // show "old and why" instead of old-looking-fresh.
+    quotaDataAgeMs: (() => {
+      const fetchedAt = getAccountQuota(account.id)?.fetchedAt;
+      return fetchedAt ? Math.max(0, Date.now() - fetchedAt) : null;
+    })(),
+    quotaRefreshError: getQuotaRefreshError(account.id),
     // Who this actually is. A consent screen approved by an existing claude.ai
     // session re-authorizes the SAME login without ever offering a picker, so
     // the email is the only honest answer to "is this a second subscription".
@@ -706,12 +717,29 @@ async function handlePanelRoutes(
         const fetchedAt = getAccountQuota(account.id)?.fetchedAt ?? 0;
         return now - fetchedAt > 10 * 60_000;
       });
-      await Promise.allSettled(
+      const results = await Promise.allSettled(
         stale.map(async (account) => {
           await probeAccountQuota(account);
           await fetchAccountIdentity(account).catch(() => null);
         }),
       );
+      // SC-51: allSettled must not swallow. probeAccountQuota already
+      // records its own failure into the store; this is the loud half —
+      // anything unexpected (fetch errors, identity crashes) surfaces as an
+      // error log AND a recorded refresh error instead of vanishing.
+      results.forEach((result, index) => {
+        if (result.status === "fulfilled") return;
+        const account = stale[index];
+        const message =
+          result.reason instanceof Error
+            ? result.reason.message
+            : String(result.reason);
+        log.error(
+          "[opencode-claude] quota refresh failed",
+          `account=${account.id} ${message}`,
+        );
+        recordQuotaRefreshError(account.id, message);
+      });
     }
     const counts = sessionCountsByAccount();
     return Response.json({
@@ -732,9 +760,20 @@ async function handlePanelRoutes(
   // Last known quota per account. Read-only and free: refreshing costs a real
   // (tiny) request, so it is a separate explicit POST.
   if (req.method === "GET" && path === "/quota") {
+    const now = Date.now();
+    const accounts = getAllAccountQuota();
     return Response.json({
       object: "quota",
-      accounts: getAllAccountQuota(),
+      accounts,
+      // Age of the last data per account, and why the last refresh failed
+      // (SC-51). `accounts` keeps its shape for existing consumers.
+      agesMs: Object.fromEntries(
+        Object.entries(accounts).map(([id, quota]) => [
+          id,
+          Math.max(0, now - quota.fetchedAt),
+        ]),
+      ),
+      refreshErrors: getAllQuotaRefreshErrors(),
     });
   }
 
