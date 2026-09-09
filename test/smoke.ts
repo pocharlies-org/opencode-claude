@@ -3099,6 +3099,78 @@ async function main() {
         assert.equal(listFailoverEvents().length, before,
           "auth and unclassified failures never fail over");
 
+        // CA-8 one case per remaining class of the matrix: 400 invalid input,
+        // model incompatibility, tool failure, local error. Each asserts the
+        // same invariant as fo-auth/fo-boom — zero failover events added and
+        // the conversation still bound to the same account. (The single call
+        // site is conditioned on the quota gate being blocked, and fat's gate
+        // is clean here, so none of these deaths can reach it.)
+
+        // 400 invalid input: an empty user turn with no tools.
+        const before400 = listFailoverEvents().length;
+        bindConversationAccount("fo-badreq", "fat", "Fat");
+        const badRes = await postFo("fo-badreq", [{ role: "user", content: "" }]);
+        assert.equal(badRes.status, 400, "invalid input is still a 400");
+        const badJson = (await badRes.json()) as { error?: { type?: string } };
+        assert.equal(badJson.error?.type, "invalid_request_error");
+        assert.equal(listFailoverEvents().length, before400,
+          "400 invalid input never triggers failover");
+        assert.equal(getSessionBinding("fo-badreq")?.accountId, "fat",
+          "the 400 leaves the conversation on the same account");
+
+        // Model incompatibility: the turn dies on a model Claude does not serve.
+        setClaudeQueryStarter(async () => ({
+          stream: (async function* () {
+            yield { type: "system", subtype: "init", session_id: "ff-sess" };
+            yield { type: "result", is_error: true, result: "The model claude-nonexistent-9 does not exist or you do not have access to it." };
+            throw new Error("Claude Code returned an error result: The model claude-nonexistent-9 does not exist or you do not have access to it.");
+          })(),
+          interrupt: async () => {},
+          close: () => {},
+          getPid: () => null,
+        }));
+        const beforeModel = listFailoverEvents().length;
+        bindConversationAccount("fo-model", "fat", "Fat");
+        const modelRes = await postFo("fo-model", [{ role: "user", content: "hi" }]);
+        assert.equal(modelRes.status, 500, "model incompatibility surfaces as its own failure");
+        assert.equal(listFailoverEvents().length, beforeModel,
+          "model incompatibility never triggers failover");
+        assert.equal(getSessionBinding("fo-model")?.accountId, "fat",
+          "the model failure leaves the conversation on the same account");
+
+        // Tool failure: the turn dies executing an OpenCode-bridged tool.
+        setClaudeQueryStarter(async () => ({
+          stream: (async function* () {
+            yield { type: "system", subtype: "init", session_id: "ff-sess" };
+            yield { type: "result", is_error: true, result: "Tool execution failed: mcp__opencode__bash exited with code 1" };
+            throw new Error("Claude Code returned an error result: Tool execution failed: mcp__opencode__bash exited with code 1");
+          })(),
+          interrupt: async () => {},
+          close: () => {},
+          getPid: () => null,
+        }));
+        const beforeTool = listFailoverEvents().length;
+        bindConversationAccount("fo-tool", "fat", "Fat");
+        const toolRes = await postFo("fo-tool", [{ role: "user", content: "hi" }]);
+        assert.equal(toolRes.status, 500, "a tool failure surfaces as its own failure");
+        assert.equal(listFailoverEvents().length, beforeTool,
+          "tool failures never trigger failover");
+        assert.equal(getSessionBinding("fo-tool")?.accountId, "fat",
+          "the tool failure leaves the conversation on the same account");
+
+        // Local error: the local CLI cannot even spawn — the starter itself throws.
+        setClaudeQueryStarter(async () => {
+          throw new Error("spawn claude ENOENT");
+        });
+        const beforeLocal = listFailoverEvents().length;
+        bindConversationAccount("fo-local", "fat", "Fat");
+        const localRes = await postFo("fo-local", [{ role: "user", content: "hi" }]);
+        assert.equal(localRes.status, 500, "a local spawn failure is a 500");
+        assert.equal(listFailoverEvents().length, beforeLocal,
+          "local errors never trigger failover");
+        assert.equal(getSessionBinding("fo-local")?.accountId, "fat",
+          "the local failure leaves the conversation on the same account");
+
         // ---- CA-9: no usable pool → explicit bounded failure, resumable ----
         recordRateLimitErrorText(
           "You've hit your usage limit · resets 1:10am (Europe/Kyiv)",
