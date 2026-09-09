@@ -2639,6 +2639,593 @@ async function main() {
       }
     }
 
+    // ---- SC-51: claude found off-PATH, and refresh failures stay visible ----
+    {
+      const sc51Dir = mkdtempSync(joinPath(tmpdir(), "oc-claude-sc51-"));
+      const prevQuota51 = process.env.OPENCODE_CLAUDE_QUOTA_STORE;
+      process.env.OPENCODE_CLAUDE_QUOTA_STORE = joinPath(sc51Dir, "quota.json");
+      const prevPath51 = process.env.PATH;
+      const prevHome51 = process.env.HOME;
+      try {
+        const {
+          resolveClaudeCodeExecutable,
+          resetClaudeCliResolutionCache,
+        } = await import("../src/executable-path.ts");
+        const {
+          recordQuotaRefreshError,
+          getQuotaRefreshError,
+          clearQuotaRefreshError,
+          refreshAccountTokenViaCli,
+          __resetQuotaStore,
+        } = await import("../src/quota.ts");
+        __resetQuotaStore();
+
+        // (a) A service PATH that misses the installer location must still
+        // find claude in ~/.local/bin — the exact SC-51 failure: the systemd
+        // unit's PATH had no ~/.local/bin, refresh died, the store aged.
+        const fakeHome = joinPath(sc51Dir, "home");
+        mkdirSync(joinPath(fakeHome, ".local", "bin"), { recursive: true });
+        const fakeBin = joinPath(fakeHome, ".local", "bin", "claude");
+        writeFileSync(fakeBin, "#!/bin/sh\necho 'claude fake 9.9.9'\n", {
+          mode: 0o755,
+        });
+        resetClaudeCliResolutionCache();
+        assert.equal(
+          resolveClaudeCodeExecutable({ env: { PATH: "", HOME: fakeHome } }),
+          fakeBin,
+          "known install location is probed after PATH",
+        );
+
+        // Nowhere to find it: null, not a guess.
+        resetClaudeCliResolutionCache();
+        assert.equal(
+          resolveClaudeCodeExecutable({
+            env: { PATH: "", HOME: joinPath(sc51Dir, "empty-home") },
+          }),
+          null,
+        );
+
+        // (b) Expired token + binary not on PATH: the failure is RECORDED and
+        // readable by the panel, never swallowed by Promise.allSettled again.
+        __resetQuotaStore();
+        process.env.PATH = "";
+        process.env.HOME = joinPath(sc51Dir, "empty-home");
+        resetClaudeCliResolutionCache();
+        const refreshed = await refreshAccountTokenViaCli({
+          id: "sc51-expired",
+          label: "SC51",
+          configDir: joinPath(sc51Dir, "cfg"),
+        });
+        assert.equal(refreshed, false);
+        const err = getQuotaRefreshError("sc51-expired");
+        assert.ok(err, "the refresh failure is visible in the store");
+        assert.match(err.message, /no claude binary found/);
+        assert.ok(err.at > 0, "the failure carries a timestamp");
+
+        // A later success retires it — the panel shows the error only while
+        // the data is actually unhealthy.
+        clearQuotaRefreshError("sc51-expired");
+        assert.equal(getQuotaRefreshError("sc51-expired"), null);
+
+        // Rename carries the error with the account; disconnect drops it.
+        recordQuotaRefreshError("sc51-old", "boom");
+        const { renameAccountQuota, clearAccountQuota } = await import(
+          "../src/quota.ts"
+        );
+        renameAccountQuota("sc51-old", "sc51-new");
+        assert.match(getQuotaRefreshError("sc51-new")?.message ?? "", /boom/);
+        assert.equal(getQuotaRefreshError("sc51-old"), null);
+        clearAccountQuota("sc51-new");
+        assert.equal(getQuotaRefreshError("sc51-new"), null);
+      } finally {
+        if (prevPath51 === undefined) delete process.env.PATH;
+        else process.env.PATH = prevPath51;
+        if (prevHome51 === undefined) delete process.env.HOME;
+        else process.env.HOME = prevHome51;
+        const { resetClaudeCliResolutionCache } = await import(
+          "../src/executable-path.ts"
+        );
+        resetClaudeCliResolutionCache();
+        if (prevQuota51 === undefined) {
+          delete process.env.OPENCODE_CLAUDE_QUOTA_STORE;
+        } else {
+          process.env.OPENCODE_CLAUDE_QUOTA_STORE = prevQuota51;
+        }
+        rmSync(sc51Dir, { recursive: true, force: true });
+      }
+    }
+
+    // ---- SC-102: quota failover between accounts ----
+    {
+      const foDir = mkdtempSync(joinPath(tmpdir(), "oc-claude-fo-"));
+      const prevXdgFo = process.env.XDG_DATA_HOME;
+      const prevQuotaFo = process.env.OPENCODE_CLAUDE_QUOTA_STORE;
+      const prevRlFo = process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE;
+      const prevIdFo = process.env.OPENCODE_CLAUDE_IDENTITY_STORE;
+      const prevFoFo = process.env.OPENCODE_CLAUDE_FAILOVER_STORE;
+      const prevAgeFo = process.env.OPENCODE_CLAUDE_FAILOVER_MAX_QUOTA_AGE_MS;
+      const prevFoFlag = process.env.OPENCODE_CLAUDE_FAILOVER;
+      process.env.XDG_DATA_HOME = foDir;
+      process.env.OPENCODE_CLAUDE_QUOTA_STORE = joinPath(foDir, "quota.json");
+      process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE = joinPath(foDir, "rl.json");
+      process.env.OPENCODE_CLAUDE_IDENTITY_STORE = joinPath(foDir, "identity.json");
+      process.env.OPENCODE_CLAUDE_FAILOVER_STORE = joinPath(foDir, "failover.json");
+      delete process.env.OPENCODE_CLAUDE_FAILOVER_MAX_QUOTA_AGE_MS;
+      delete process.env.OPENCODE_CLAUDE_FAILOVER;
+
+      const {
+        setClaudeQueryStarter,
+      } = await import("../src/proxy.ts");
+      const { getForeignSessionId, setForeignSessionId } = await import(
+        "../src/session-store.ts"
+      );
+      const { writeAccountCredentials } = await import("../src/account-login.ts");
+      const {
+        recordQuotaFromHeaders,
+        getAccountQuota,
+        __resetQuotaStore,
+      } = await import("../src/quota.ts");
+      const { recordRateLimitErrorText } = await import("../src/rate-limit.ts");
+      const { storeAccountIdentity } = await import("../src/identity.ts");
+      const {
+        selectFailoverDestination,
+        failoverEnabled,
+        recordFailoverCooldown,
+        failoverCooldown,
+        listFailoverEvents,
+        __resetFailoverStore,
+      } = await import("../src/failover.ts");
+
+      const roster = [
+        { id: "dry", label: "Dry", configDir: joinPath(foDir, "c-dry"), default: true },
+        { id: "fat", label: "Fat", configDir: joinPath(foDir, "c-fat") },
+        { id: "twin", label: "Twin", configDir: joinPath(foDir, "c-twin") },
+        { id: "orgmate", label: "Orgmate", configDir: joinPath(foDir, "c-org") },
+        { id: "ghost", label: "Ghost", configDir: joinPath(foDir, "c-ghost") },
+        { id: "mid", label: "Mid", configDir: joinPath(foDir, "c-mid") },
+      ];
+      const accountById = (id: string) =>
+        roster.find((a) => a.id === id)! as { id: string; label: string; configDir: string };
+
+      const resetFixtures = () => {
+        __resetQuotaStore();
+        __resetFailoverStore();
+        configureAccounts(roster);
+        // twin/orgmate/ghost: ghost keeps credentials (the "unknown" verdict
+        // needs an authenticated account with no measurements), the other two
+        // are signed out so they are also inert as destinations for accounts
+        // that do not share their budget.
+        for (const a of roster) {
+          if (!["dry", "fat", "ghost"].includes(a.id)) continue;
+          writeAccountCredentials(accountById(a.id), {
+            access: "a",
+            refresh: "r",
+            expires: Date.now() + 3_600_000,
+          });
+        }
+        // dry and twin are ONE login; dry and orgmate share one org.
+        storeAccountIdentity("dry", { accountUuid: "u-shared", fetchedAt: Date.now() });
+        storeAccountIdentity("twin", { accountUuid: "u-shared", fetchedAt: Date.now() });
+        const in3d = Math.floor((Date.now() + 259_200_000) / 1000);
+        const win = (u: number, org?: string) =>
+          new Headers({
+            "anthropic-ratelimit-unified-7d-utilization": String(u),
+            "anthropic-ratelimit-unified-7d-reset": String(in3d),
+            ...(org ? { "anthropic-organization-id": org } : {}),
+          });
+        recordQuotaFromHeaders("dry", win(1, "org-shared"));
+        recordQuotaFromHeaders("fat", win(0.12));
+        recordQuotaFromHeaders("orgmate", win(0.1, "org-shared"));
+        recordQuotaFromHeaders("mid", win(0.5));
+        // ghost: authenticated but never measured.
+      };
+
+      const postFo = (sessionHeader: string, messages: unknown[]) =>
+        fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-opencode-claude-session": sessionHeader,
+          },
+          body: JSON.stringify({ model: "sonnet", stream: false, messages }),
+        });
+
+      const mockOk = (seen: { prompt?: string; resume?: string } | null) => {
+        setClaudeQueryStarter(async (params) => {
+          if (seen) {
+            seen.prompt = String(params.prompt ?? "");
+            seen.resume = params.resume as string | undefined;
+          }
+          return {
+            stream: (async function* () {
+              yield { type: "system", subtype: "init", session_id: "mock-sess-fo" };
+              yield {
+                type: "stream_event",
+                event: {
+                  type: "content_block_delta",
+                  delta: { type: "text_delta", text: "MOCK_FO" },
+                },
+              };
+              yield { type: "result", is_error: false, usage: {} };
+            })(),
+            interrupt: async () => {},
+            close: () => {},
+            getPid: () => null,
+          };
+        });
+      };
+
+      try {
+        resetFixtures();
+
+        // ---- CA-11 rollback flag ----
+        process.env.OPENCODE_CLAUDE_FAILOVER = "off";
+        assert.equal(failoverEnabled(), false);
+        delete process.env.OPENCODE_CLAUDE_FAILOVER;
+        assert.equal(failoverEnabled(), true);
+
+        // ---- CA-2/CA-3/CA-7: selection reads only the existing stores ----
+        const d1 = selectFailoverDestination("dry", { isAuthenticated: () => true });
+        assert.equal(d1.destination?.id, "fat", "the usable quota wins");
+        const reasonOf = (id: string) =>
+          d1.candidates.find((c) => c.account === id)?.reason ?? "";
+        assert.match(reasonOf("twin"), /shares budget/);
+        assert.match(reasonOf("orgmate"), /shares budget/);
+        assert.match(reasonOf("ghost"), /no quota data \(unknown\)/);
+        assert.match(reasonOf("mid"), /usable/);
+        assert.match(reasonOf("dry"), /^origin$/);
+
+        // CA-4: a just-failed destination is not re-elected; other pools stay
+        // selectable (global_block=false).
+        recordFailoverCooldown("fat", Date.now() + 3_600_000, "quota exhausted");
+        const d2 = selectFailoverDestination("dry", { isAuthenticated: () => true });
+        assert.equal(d2.destination?.id, "mid", "cooldown on one pool does not block others");
+        const d2Fat = d2.candidates.find((c) => c.account === "fat")!;
+        assert.equal(d2Fat.eligible, false);
+        assert.match(d2Fat.reason, /in cooldown/);
+        // Durability across a process restart: the cooldown lives in the file
+        // store, not memory — a fresh read (what a restarted process does)
+        // still sees it.
+        const d2Again = selectFailoverDestination("dry", { isAuthenticated: () => true });
+        assert.equal(d2Again.destination?.id, "mid", "cooldown survives re-read");
+        // Expiry: the cooldown ends when its until passes. (The record API
+        // floors short durations on purpose, so expire it in the store.)
+        {
+          const { readFileSync } = await import("node:fs");
+          const foPath = process.env.OPENCODE_CLAUDE_FAILOVER_STORE!;
+          const raw = JSON.parse(readFileSync(foPath, "utf8"));
+          raw.cooldowns.fat.until = Date.now() - 1;
+          writeFileSync(foPath, JSON.stringify(raw));
+        }
+        const d3 = selectFailoverDestination("dry", { isAuthenticated: () => true });
+        assert.equal(d3.destination?.id, "fat", "an expired cooldown releases");
+
+        // CA-2: stale, zero-with-reset (spent) and zero-without-reset
+        // (inconclusive) are distinct and NEVER count as available.
+        writeFileSync(
+          process.env.OPENCODE_CLAUDE_QUOTA_STORE!,
+          JSON.stringify({
+            version: 1,
+            accounts: {
+              fat: {
+                windows: { sevenDay: { utilization: 0.1, remaining: 0.9 } },
+                fetchedAt: Date.now() - 7 * 86_400_000,
+                source: "headers",
+              },
+              mid: {
+                windows: { sevenDay: { utilization: 0.5, remaining: 0.5 } },
+                fetchedAt: Date.now(),
+                source: "headers",
+              },
+            },
+            refreshErrors: {},
+          }),
+        );
+        const dStale = selectFailoverDestination("dry", { isAuthenticated: () => true });
+        assert.equal(dStale.destination?.id, "mid", "stale data is not availability");
+        assert.match(
+          dStale.candidates.find((c) => c.account === "fat")!.reason,
+          /stale/,
+        );
+
+        resetFixtures();
+        const in3dSec = Math.floor((Date.now() + 259_200_000) / 1000);
+        recordQuotaFromHeaders("fat", new Headers({
+          "anthropic-ratelimit-unified-7d-utilization": "1",
+          "anthropic-ratelimit-unified-7d-reset": String(in3dSec),
+        }));
+        assert.match(
+          selectFailoverDestination("dry", { isAuthenticated: () => true })
+            .candidates.find((c) => c.account === "fat")!.reason,
+          /spent/,
+        );
+        recordQuotaFromHeaders("fat", new Headers({
+          "anthropic-ratelimit-unified-7d-utilization": "1",
+        }));
+        assert.match(
+          selectFailoverDestination("dry", { isAuthenticated: () => true })
+            .candidates.find((c) => c.account === "fat")!.reason,
+          /inconclusive/,
+        );
+        // A signed-out account is never a destination (CA-6: only the roster
+        // already connected, and only with credentials).
+        resetFixtures();
+        const { hasClaudeCliOAuthCredentials } = await import(
+          "../src/credentials.ts"
+        );
+        assert.match(
+          selectFailoverDestination("dry", {
+            isAuthenticated: (a) =>
+              hasClaudeCliOAuthCredentials({ configDir: a.configDir }),
+          }).candidates.find((c) => c.account === "mid")!.reason,
+          /not authenticated/,
+        );
+
+        // ---- CA-1 rebind unit: key survives, only the account moves ----
+        bindConversationAccount("fo-rebound", "dry", "Dry");
+        setForeignSessionId("fo-rebound", "sess-dry-1", {
+          modelId: "opus",
+          accountId: "dry",
+          accountLabel: "Dry",
+        });
+        bindConversationAccount("fo-rebound", "fat", "Fat");
+        const reboundBinding = getSessionBinding("fo-rebound")!;
+        assert.equal(reboundBinding.conversationKey, "fo-rebound", "session key unchanged");
+        assert.equal(reboundBinding.accountId, "fat", "only the account changed");
+        assert.equal(reboundBinding.modelId, "opus", "logical model preserved");
+        assert.equal(reboundBinding.rebound, true, "machinery move flags rebound");
+        assert.equal(reboundBinding.foreignSessionId, "", "old resume target dropped");
+
+        // ---- CA-1/CA-5 end to end: the gate's 429 becomes a switch ----
+        resetFixtures();
+        bindConversationAccount("fo-live", "dry", "Dry");
+        setForeignSessionId("fo-live", "sess-dry-1", {
+          modelId: "opus",
+          accountId: "dry",
+          accountLabel: "Dry",
+        });
+        recordRateLimitErrorText(
+          "You've hit your session limit · resets 1:10am (Europe/Kyiv)",
+          "dry",
+        );
+        const foSeen = {} as { prompt: string; resume?: string };
+        mockOk(foSeen);
+        const foRes = await postFo("fo-live", [
+          { role: "user", content: "remember the codename AXIOM-9042" },
+          { role: "assistant", content: "Noted." },
+          { role: "user", content: "what is the codename?" },
+        ]);
+        assert.equal(foRes.status, 200, "the turn continues on the other account");
+        const foJson = (await foRes.json()) as {
+          choices?: Array<{ message?: { content?: string } }>;
+        };
+        assert.match(String(foJson.choices?.[0]?.message?.content ?? ""), /MOCK_FO/);
+        // CA-1: the conversation continues under the new account with no
+        // Claude-side history transfer (opencode resends the full messages
+        // every turn; the rebound flag omits the paid re-injection, so the
+        // history is neither transferred twice nor charged to the new pool).
+        assert.equal(foSeen.resume, undefined, "no resume across accounts");
+        assert.ok(!foSeen.prompt.includes("<conversation_history>"),
+          "rebound turn does not re-inject history");
+        assert.match(foSeen.prompt, /what is the codename\?/);
+        const liveBinding = getSessionBinding("fo-live")!;
+        assert.equal(liveBinding.accountId, "fat");
+        // The binding's model is the turn's own model (as on every turn), not
+        // something the account switch rewrote: the failover moved the
+        // account and nothing else.
+        assert.equal(liveBinding.modelId, resolveWithAccount("sonnet"));
+        assert.equal(getForeignSessionId("fo-live"), "mock-sess-fo",
+          "the new account records its own session");
+        // CA-4 natural cooldown: origin is out until its window resets.
+        assert.ok(failoverCooldown("dry"), "origin gets a cooldown");
+
+        // CA-5: the trace exists, complete and secret-free.
+        const foEvents = listFailoverEvents();
+        assert.equal(foEvents.length, 1);
+        const ev = foEvents[0];
+        assert.equal(ev.type, "account_failover");
+        assert.equal(ev.from, "dry");
+        assert.equal(ev.to, "fat");
+        assert.equal(ev.reason, "quota_gate_429");
+        assert.equal(ev.outcome, "switched");
+        assert.equal(ev.attempt, 1);
+        assert.ok(ev.fromQuota && ev.fromQuota.ageMs >= 0, "origin quota with age");
+        assert.ok(ev.toQuota?.source, "destination quota with source");
+        assert.ok(ev.candidates.some((c) => c.account === "ghost" && !c.eligible));
+        const evText = JSON.stringify(ev);
+        assert.ok(!/accessToken|Bearer|refresh[_-]?token/i.test(evText),
+          "the trace carries no secrets");
+
+        // ---- CA-5 bidirectional: the provider `fallback` header is metadata ----
+        // (i) fallback present, no hard limit → no failover, no event.
+        recordQuotaFromHeaders("fat", new Headers({
+          "anthropic-ratelimit-unified-7d-utilization": "0.3",
+          "anthropic-ratelimit-unified-fallback": "available",
+          "anthropic-ratelimit-unified-fallback-percentage": "0.5",
+        }));
+        assert.equal(getAccountQuota("fat")?.fallback?.availability, "available");
+        bindConversationAccount("fo-fb", "fat", "Fat");
+        const fbRes = await postFo("fo-fb", [{ role: "user", content: "hi" }]);
+        assert.equal(fbRes.status, 200);
+        assert.equal(listFailoverEvents().length, 1,
+          "the fallback header neither triggers nor records a failover");
+        // (ii) the recorded failover stands without any fallback metadata:
+        // dry's quota never carried the header, yet the event exists.
+        assert.equal(getAccountQuota("dry")?.fallback, undefined);
+        assert.ok(listFailoverEvents().some((e) => e.type === "account_failover"));
+
+        // ---- CA-10 concurrency: one decision for two simultaneous 429s ----
+        bindConversationAccount("fo-conc", "dry", "Dry");
+        mockOk(null);
+        const [conc1, conc2] = await Promise.all([
+          postFo("fo-conc", [{ role: "user", content: "one" }]),
+          postFo("fo-conc", [{ role: "user", content: "one" }]),
+        ]);
+        assert.equal(conc1.status, 200);
+        assert.equal(conc2.status, 200);
+        const concEvents = listFailoverEvents().filter((e) => e.sessionId === "fo-conc");
+        assert.equal(concEvents.length, 1, "one coherent decision");
+        assert.equal(concEvents[0].attempt, 1);
+        assert.equal(concEvents[0].to, "fat");
+
+        // ---- CA-8: only quota switches — auth and unknown deaths do not ----
+        const before = listFailoverEvents().length;
+        setClaudeQueryStarter(async () => ({
+          stream: (async function* () {
+            yield { type: "system", subtype: "init", session_id: "ff-sess" };
+            yield { type: "result", is_error: true, result: "Invalid API key · Please run /login" };
+            throw new Error("Claude Code returned an error result: Invalid API key · Please run /login");
+          })(),
+          interrupt: async () => {},
+          close: () => {},
+          getPid: () => null,
+        }));
+        bindConversationAccount("fo-auth", "fat", "Fat");
+        const authRes = await postFo("fo-auth", [{ role: "user", content: "hi" }]);
+        assert.equal(authRes.status, 401);
+        setClaudeQueryStarter(async () => ({
+          stream: (async function* () {
+            yield { type: "system", subtype: "init", session_id: "ff-sess" };
+            yield { type: "result", is_error: true, result: "Claude Code process exploded" };
+            throw new Error("Claude Code returned an error result: Claude Code process exploded");
+          })(),
+          interrupt: async () => {},
+          close: () => {},
+          getPid: () => null,
+        }));
+        bindConversationAccount("fo-boom", "fat", "Fat");
+        const boomRes = await postFo("fo-boom", [{ role: "user", content: "hi" }]);
+        assert.equal(boomRes.status, 500);
+        assert.equal(listFailoverEvents().length, before,
+          "auth and unclassified failures never fail over");
+
+        // CA-8 one case per remaining class of the matrix: 400 invalid input,
+        // model incompatibility, tool failure, local error. Each asserts the
+        // same invariant as fo-auth/fo-boom — zero failover events added and
+        // the conversation still bound to the same account. (The single call
+        // site is conditioned on the quota gate being blocked, and fat's gate
+        // is clean here, so none of these deaths can reach it.)
+
+        // 400 invalid input: an empty user turn with no tools.
+        const before400 = listFailoverEvents().length;
+        bindConversationAccount("fo-badreq", "fat", "Fat");
+        const badRes = await postFo("fo-badreq", [{ role: "user", content: "" }]);
+        assert.equal(badRes.status, 400, "invalid input is still a 400");
+        const badJson = (await badRes.json()) as { error?: { type?: string } };
+        assert.equal(badJson.error?.type, "invalid_request_error");
+        assert.equal(listFailoverEvents().length, before400,
+          "400 invalid input never triggers failover");
+        assert.equal(getSessionBinding("fo-badreq")?.accountId, "fat",
+          "the 400 leaves the conversation on the same account");
+
+        // Model incompatibility: the turn dies on a model Claude does not serve.
+        setClaudeQueryStarter(async () => ({
+          stream: (async function* () {
+            yield { type: "system", subtype: "init", session_id: "ff-sess" };
+            yield { type: "result", is_error: true, result: "The model claude-nonexistent-9 does not exist or you do not have access to it." };
+            throw new Error("Claude Code returned an error result: The model claude-nonexistent-9 does not exist or you do not have access to it.");
+          })(),
+          interrupt: async () => {},
+          close: () => {},
+          getPid: () => null,
+        }));
+        const beforeModel = listFailoverEvents().length;
+        bindConversationAccount("fo-model", "fat", "Fat");
+        const modelRes = await postFo("fo-model", [{ role: "user", content: "hi" }]);
+        assert.equal(modelRes.status, 500, "model incompatibility surfaces as its own failure");
+        assert.equal(listFailoverEvents().length, beforeModel,
+          "model incompatibility never triggers failover");
+        assert.equal(getSessionBinding("fo-model")?.accountId, "fat",
+          "the model failure leaves the conversation on the same account");
+
+        // Tool failure: the turn dies executing an OpenCode-bridged tool.
+        setClaudeQueryStarter(async () => ({
+          stream: (async function* () {
+            yield { type: "system", subtype: "init", session_id: "ff-sess" };
+            yield { type: "result", is_error: true, result: "Tool execution failed: mcp__opencode__bash exited with code 1" };
+            throw new Error("Claude Code returned an error result: Tool execution failed: mcp__opencode__bash exited with code 1");
+          })(),
+          interrupt: async () => {},
+          close: () => {},
+          getPid: () => null,
+        }));
+        const beforeTool = listFailoverEvents().length;
+        bindConversationAccount("fo-tool", "fat", "Fat");
+        const toolRes = await postFo("fo-tool", [{ role: "user", content: "hi" }]);
+        assert.equal(toolRes.status, 500, "a tool failure surfaces as its own failure");
+        assert.equal(listFailoverEvents().length, beforeTool,
+          "tool failures never trigger failover");
+        assert.equal(getSessionBinding("fo-tool")?.accountId, "fat",
+          "the tool failure leaves the conversation on the same account");
+
+        // Local error: the local CLI cannot even spawn — the starter itself throws.
+        setClaudeQueryStarter(async () => {
+          throw new Error("spawn claude ENOENT");
+        });
+        const beforeLocal = listFailoverEvents().length;
+        bindConversationAccount("fo-local", "fat", "Fat");
+        const localRes = await postFo("fo-local", [{ role: "user", content: "hi" }]);
+        assert.equal(localRes.status, 500, "a local spawn failure is a 500");
+        assert.equal(listFailoverEvents().length, beforeLocal,
+          "local errors never trigger failover");
+        assert.equal(getSessionBinding("fo-local")?.accountId, "fat",
+          "the local failure leaves the conversation on the same account");
+
+        // ---- CA-9: no usable pool → explicit bounded failure, resumable ----
+        recordRateLimitErrorText(
+          "You've hit your usage limit · resets 1:10am (Europe/Kyiv)",
+          "fat",
+        );
+        mockOk(null);
+        const noneRes = await postFo("fo-live", [{ role: "user", content: "again?" }]);
+        assert.equal(noneRes.status, 429);
+        const noneJson = (await noneRes.json()) as { error?: { message?: string } };
+        assert.match(noneJson.error?.message ?? "", /no failover destination/);
+        assert.match(noneJson.error?.message ?? "", /in cooldown|unknown|not authenticated/,
+          "the 429 says why nothing was usable");
+        assert.equal(getSessionBinding("fo-live")?.accountId, "fat",
+          "the binding survives the failed attempt");
+        assert.equal(getForeignSessionId("fo-live"), "mock-sess-fo",
+          "the resume target survives: the conversation resumes when a window does");
+        const noneEvents = listFailoverEvents().filter(
+          (e) => e.sessionId === "fo-live" && e.outcome === "no_destination",
+        );
+        assert.equal(noneEvents.length, 1);
+        assert.equal(noneEvents[0].attempt, 2, "the attempt counter advances");
+
+        // ---- CA-11 end to end: rollback ceases switches, verifiably ----
+        process.env.OPENCODE_CLAUDE_FAILOVER = "off";
+        resetFixtures();
+        recordRateLimitErrorText(
+          "You've hit your session limit · resets 1:10am (Europe/Kyiv)",
+          "dry",
+        );
+        bindConversationAccount("fo-off", "dry", "Dry");
+        const eventsBefore = listFailoverEvents().length;
+        const offRes = await postFo("fo-off", [{ role: "user", content: "hi" }]);
+        assert.equal(offRes.status, 429, "with the flag off the gate answers as before");
+        assert.equal(listFailoverEvents().length, eventsBefore,
+          "no failover is even attempted with the flag off");
+      } finally {
+        setClaudeQueryStarter(null);
+        if (prevXdgFo === undefined) delete process.env.XDG_DATA_HOME;
+        else process.env.XDG_DATA_HOME = prevXdgFo;
+        if (prevQuotaFo === undefined) delete process.env.OPENCODE_CLAUDE_QUOTA_STORE;
+        else process.env.OPENCODE_CLAUDE_QUOTA_STORE = prevQuotaFo;
+        if (prevRlFo === undefined) delete process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE;
+        else process.env.OPENCODE_CLAUDE_RATE_LIMIT_STORE = prevRlFo;
+        if (prevIdFo === undefined) delete process.env.OPENCODE_CLAUDE_IDENTITY_STORE;
+        else process.env.OPENCODE_CLAUDE_IDENTITY_STORE = prevIdFo;
+        if (prevFoFo === undefined) delete process.env.OPENCODE_CLAUDE_FAILOVER_STORE;
+        else process.env.OPENCODE_CLAUDE_FAILOVER_STORE = prevFoFo;
+        if (prevAgeFo === undefined) delete process.env.OPENCODE_CLAUDE_FAILOVER_MAX_QUOTA_AGE_MS;
+        else process.env.OPENCODE_CLAUDE_FAILOVER_MAX_QUOTA_AGE_MS = prevAgeFo;
+        if (prevFoFlag === undefined) delete process.env.OPENCODE_CLAUDE_FAILOVER;
+        else process.env.OPENCODE_CLAUDE_FAILOVER = prevFoFlag;
+        rmSync(foDir, { recursive: true, force: true });
+      }
+    }
+
     // ---- Panel: account CRUD, OAuth handoff, usage, CSRF ----
     {
       const panelDir = mkdtempSync(joinPath(tmpdir(), "oc-claude-panel-"));

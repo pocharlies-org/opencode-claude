@@ -46,6 +46,16 @@ import {
   pickAccountForNewConversation,
 } from "./account-availability.js";
 import {
+  failoverAttempt,
+  failoverEnabled,
+  failoverQuotaRef,
+  listFailoverEvents,
+  maxSwitchesPerRequest,
+  recordFailoverCooldown,
+  recordFailoverEvent,
+  selectFailoverDestination,
+} from "./failover.js";
+import {
   clearAccountCredentials,
   completeAccountLogin,
   findPendingLoginByState,
@@ -77,9 +87,12 @@ import {
   formatQuotaSummary,
   getAccountQuota,
   getAllAccountQuota,
+  getAllQuotaRefreshErrors,
+  getQuotaRefreshError,
   mergeSdkRateLimitEvent,
   probeAccountQuota,
   recordQuotaFromPlanUsage,
+  recordQuotaRefreshError,
   renameAccountQuota,
 } from "./quota.js";
 import {
@@ -579,6 +592,14 @@ function describeAccount(
     rateLimit: getRateLimitSnapshot(Date.now(), account.id),
     usage: getAccountUsage(account.id),
     quota: getAccountQuota(account.id),
+    // SC-51: quota data that stopped updating is not healthy data. The age
+    // and the last refresh failure travel with the numbers so the panel can
+    // show "old and why" instead of old-looking-fresh.
+    quotaDataAgeMs: (() => {
+      const fetchedAt = getAccountQuota(account.id)?.fetchedAt;
+      return fetchedAt ? Math.max(0, Date.now() - fetchedAt) : null;
+    })(),
+    quotaRefreshError: getQuotaRefreshError(account.id),
     // Who this actually is. A consent screen approved by an existing claude.ai
     // session re-authorizes the SAME login without ever offering a picker, so
     // the email is the only honest answer to "is this a second subscription".
@@ -706,12 +727,29 @@ async function handlePanelRoutes(
         const fetchedAt = getAccountQuota(account.id)?.fetchedAt ?? 0;
         return now - fetchedAt > 10 * 60_000;
       });
-      await Promise.allSettled(
+      const results = await Promise.allSettled(
         stale.map(async (account) => {
           await probeAccountQuota(account);
           await fetchAccountIdentity(account).catch(() => null);
         }),
       );
+      // SC-51: allSettled must not swallow. probeAccountQuota already
+      // records its own failure into the store; this is the loud half —
+      // anything unexpected (fetch errors, identity crashes) surfaces as an
+      // error log AND a recorded refresh error instead of vanishing.
+      results.forEach((result, index) => {
+        if (result.status === "fulfilled") return;
+        const account = stale[index];
+        const message =
+          result.reason instanceof Error
+            ? result.reason.message
+            : String(result.reason);
+        log.error(
+          "[opencode-claude] quota refresh failed",
+          `account=${account.id} ${message}`,
+        );
+        recordQuotaRefreshError(account.id, message);
+      });
     }
     const counts = sessionCountsByAccount();
     return Response.json({
@@ -732,9 +770,29 @@ async function handlePanelRoutes(
   // Last known quota per account. Read-only and free: refreshing costs a real
   // (tiny) request, so it is a separate explicit POST.
   if (req.method === "GET" && path === "/quota") {
+    const now = Date.now();
+    const accounts = getAllAccountQuota();
     return Response.json({
       object: "quota",
-      accounts: getAllAccountQuota(),
+      accounts,
+      // Age of the last data per account, and why the last refresh failed
+      // (SC-51). `accounts` keeps its shape for existing consumers.
+      agesMs: Object.fromEntries(
+        Object.entries(accounts).map(([id, quota]) => [
+          id,
+          Math.max(0, now - quota.fetchedAt),
+        ]),
+      ),
+      refreshErrors: getAllQuotaRefreshErrors(),
+    });
+  }
+
+  // CA-5 trace: every failover decision, newest first. Read-only and free.
+  if (req.method === "GET" && path === "/failovers") {
+    return Response.json({
+      object: "list",
+      type: "account_failover",
+      data: listFailoverEvents(),
     });
   }
 
@@ -1135,6 +1193,82 @@ function resolveTurnAccount(
   return { account: placement.account, switched: false };
 }
 
+/**
+ * One failover decision per conversation at a time (CA-10). Two requests
+ * that hit the same exhausted account concurrently await the same decision:
+ * one destination, one trace event, no duplicate responses, and the origin
+ * gets its cooldown exactly once.
+ */
+const failoverInFlight = new Map<
+  string,
+  Promise<{ account: ClaudeAccount | null; summary?: string }>
+>();
+
+/**
+ * The conversation's account has a confirmed hard quota limit. Move it to the
+ * account with the most usable quota on record, or return null to let the
+ * honest 429 happen (CA-9: bounded failure, binding and resume target
+ * untouched, so the conversation resumes on the origin when its window does).
+ *
+ * Only the quota gate calls this (CA-8) — auth, 400s, tool and local failures
+ * never reach it. The Anthropic `fallback` header is provider metadata and
+ * plays no part here (CA-5).
+ */
+async function failOverConversation(
+  sessionKey: string,
+  origin: ClaudeAccount,
+): Promise<{ account: ClaudeAccount | null; summary?: string }> {
+  const running = failoverInFlight.get(sessionKey);
+  if (running) return running;
+  const run = (async (): Promise<{ account: ClaudeAccount | null; summary?: string }> => {
+    const now = Date.now();
+    const gate = rateLimitGate(now, origin.id);
+    const decision = selectFailoverDestination(origin.id, {
+      now,
+      isAuthenticated: (account) => credentialProbe(account),
+    });
+    const dest = decision.destination;
+    recordFailoverEvent({
+      type: "account_failover",
+      ts: now,
+      sessionId: sessionKey,
+      attempt: failoverAttempt(sessionKey),
+      from: origin.id,
+      to: dest?.id ?? null,
+      reason: "quota_gate_429",
+      fromQuota: failoverQuotaRef(origin.id, now),
+      ...(dest ? { toQuota: failoverQuotaRef(dest.id, now) } : {}),
+      outcome: dest ? "switched" : "no_destination",
+      candidates: decision.candidates,
+    });
+    if (!dest) {
+      log.warn("[opencode-claude] quota failover found no usable account", {
+        conversationKey: sessionKey,
+        account: origin.id,
+        summary: decision.summary,
+      });
+      return { account: null, summary: decision.summary };
+    }
+    // CA-4: the just-failed pool is not re-elected until its window resets
+    // (or the cooldown floor). Durable, so a restart cannot resurrect it.
+    recordFailoverCooldown(
+      origin.id,
+      gate.blocked ? gate.resetsAt : undefined,
+      "quota exhausted",
+      now,
+    );
+    log.warn("[opencode-claude] quota failover switched account", {
+      conversationKey: sessionKey,
+      from: origin.id,
+      to: dest.id,
+      toHeadroom: decision.candidates.find((c) => c.account === dest.id)?.headroom,
+    });
+    return { account: dest };
+  })().finally(() => failoverInFlight.delete(sessionKey));
+  failoverInFlight.set(sessionKey, run);
+  return run;
+}
+
 /** Env flag to turn the `[account]` title prefix off. */
 function titleTagDisabled(): boolean {
   const flag = (process.env.OPENCODE_CLAUDE_ACCOUNT_TITLE_TAG ?? "").toLowerCase();
@@ -1206,11 +1340,34 @@ async function handleChatCompletions(
   // window the rest of this turn touches.
   // Keyed on the chat, not on the namespaced request key, so a title/summary
   // request bills the same subscription as the turn that triggered it.
-  const { account, switched } = resolveTurnAccount(sessionKey, selection.account);
+  let { account, switched } = resolveTurnAccount(sessionKey, selection.account);
+  // Quota failover (SC-102): the gate's 429 used to be the end of the turn
+  // even with healthy subscriptions next door. Before anything is bound,
+  // env'd or spawned against a confirmed-exhausted account, ask the stores
+  // whether another account can serve. Only the quota gate gets here (CA-8);
+  // meta requests keep their heuristic fallback and must not move anything.
+  let failoverBlocked = false;
+  let failoverSummary: string | undefined;
+  if (
+    !metaKind &&
+    failoverEnabled() &&
+    maxSwitchesPerRequest() >= 1 &&
+    rateLimitGate(Date.now(), account.id).blocked
+  ) {
+    failoverBlocked = true;
+    const moved = await failOverConversation(sessionKey, account);
+    if (moved.account) account = moved.account;
+    else failoverSummary = moved.summary;
+  }
   // Read before the write below: the account this process served on the
   // PREVIOUS turn of this same live conversation.
   const servedAccount = liveSessionAccounts.get(sessionKey);
-  const deliberateSwitch = Boolean(servedAccount && servedAccount !== account.id);
+  // A failover move is machinery, never the operator steering: it must not
+  // read as a deliberate switch (which would clear `rebound` and queue an
+  // unbounded history transfer against the account that just took the turn).
+  const failoverMoved = !metaKind && servedAccount !== undefined && servedAccount !== account.id && failoverBlocked;
+  const deliberateSwitch =
+    Boolean(servedAccount && servedAccount !== account.id) && !failoverMoved;
   if (switched) {
     log.info("[opencode-claude] session moved to another Claude account", {
       conversationKey: sessionKey,
@@ -1526,10 +1683,17 @@ async function handleChatCompletions(
       retryAfterSeconds: gate.retryAfterSeconds,
     });
     const gateSummary = formatQuotaSummary(getAccountQuota(account.id));
+    // CA-9: this 429 now only ends a turn after failover had its chance. When
+    // it found nothing, say so and why — bounded, honest, and the binding and
+    // resume target are untouched so the conversation resumes on its own
+    // account when the window does.
+    const failoverNote = failoverSummary
+      ? ` · no failover destination (${failoverSummary})`
+      : "";
     return Response.json(
       {
         error: {
-          message: gateSummary ? `${gate.message} · ${gateSummary}` : gate.message,
+          message: `${gateSummary ? `${gate.message} · ${gateSummary}` : gate.message}${failoverNote}`,
           type: "rate_limit_error",
           code: "claude_session_limit",
           ...(gate.resetsAt !== undefined

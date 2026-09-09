@@ -351,6 +351,12 @@ The plugin gets those numbers two ways:
 The panel shows each window as *percent left* with a reset countdown, marks the
 binding one, and colours it amber under 25% and red under 10%.
 
+Stale data is shown as stale. `GET /v1/quota` carries `agesMs` (age of the last
+reading per account) and `refreshErrors` (why the last refresh failed — e.g. a
+missing `claude` binary), and each account row in `GET /v1/accounts` carries
+`quotaDataAgeMs` + `quotaRefreshError`. A refresh failure is never silent: it
+logs at error level and stays visible until a refresh succeeds.
+
 **Inside the session, not only in the panel.** Ordinary turns emit Agent SDK
 `rate_limit_event`s, and each one is merged into the stored quota — merged, not
 replaced, since an event carries a single window and overwriting would erase
@@ -381,10 +387,46 @@ errors (including the parsed reset time) to
 - `OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL=0` disables the 429 gate (turns are
   attempted and error normally).
 
+### Quota failover between accounts
+
+When the rate-limit gate confirms a hard quota limit on the account serving a
+conversation, the turn no longer ends there if another account can serve it.
+The conversation switches to the account with the most usable quota on record:
+
+- Destinations are chosen from the **existing** stores (`quota.json`,
+  `rate-limit.json`) — no second usage poller, no extra requests. An account
+  with no data, stale data (older than `OPENCODE_CLAUDE_FAILOVER_MAX_QUOTA_AGE_MS`,
+  default 15 min) or a zero with no reset stamp is never counted as available.
+- Accounts sharing a login or an organization with the exhausted account are
+  the **same budget** and are never destinations.
+- A just-failed account is not re-elected until its window resets (floored at
+  `OPENCODE_CLAUDE_FAILOVER_MIN_COOLDOWN_MS`, default 5 min). Cooldowns are
+  per-account — an exhausted pool never blocks another one's failover — and
+  durable across restarts.
+- The switch rebinds the conversation under the **same session key**: role,
+  logical model and OpenCode session id are preserved; only the account
+  attribute changes. The first turn on the new account starts fresh without
+  paying to re-inject history (OpenCode ships the full message list every turn
+  regardless).
+- Every decision is traced as an `account_failover` event — timestamp, session,
+  attempt, origin, destination, reason, quota source + age for both sides, and
+  each candidate's eligibility verdict — readable at `GET /v1/failovers`, no
+  secrets. Anthropic's `fallback` response header is provider metadata: it
+  neither triggers nor records a failover.
+- With no usable account the turn ends with the same bounded 429 as before,
+  plus the reason; the binding and resume target survive, so the conversation
+  resumes on its own account when its window does.
+- Only quota limits switch. Auth failures, 400s, model incompatibilities, tool
+  errors, local errors and unclassified 5xx never do.
+- Rollback: `OPENCODE_CLAUDE_FAILOVER=off` ceases new switches; the gate
+  answers 429 exactly as before.
+
 ## Requirements
 
 - [OpenCode](https://opencode.ai)
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) on `PATH`
+  (or in a known install location — `~/.local/bin`, the npm global bin — which
+  service-manager PATHs usually miss)
 - Claude Pro/Max subscription (or CLI OAuth credentials)
 - Bun (plugin runtime) · Node.js ≥ 18
 
@@ -405,6 +447,11 @@ Optional knobs:
 - `CLAUDE_CODE_OAUTH_TOKEN` — inject a subscription token (CI / headless)
 - `OPENCODE_CLAUDE_RATE_LIMIT_FAST_FAIL` — `0` disables the 429 rate-limit gate
 - `OPENCODE_CLAUDE_RATE_LIMIT_STORE` — override the rate-limit store path (tests)
+- `OPENCODE_CLAUDE_FAILOVER` — `off` ceases new quota failover switches (rollback)
+- `OPENCODE_CLAUDE_FAILOVER_MAX_QUOTA_AGE_MS` — freshest quota accepted as a destination verdict (default `900000`)
+- `OPENCODE_CLAUDE_FAILOVER_MIN_COOLDOWN_MS` — cooldown floor when no reset time is known (default `300000`)
+- `OPENCODE_CLAUDE_FAILOVER_MAX_SWITCHES` — max destination switches within one request (default `1`)
+- `OPENCODE_CLAUDE_FAILOVER_STORE` — override the failover trace/cooldown store path (tests)
 - `OPENCODE_CLAUDE_HISTORY_MAX_CHARS` — budget for transferred conversation history when a Claude session cannot be resumed (default `400000`; newest messages are kept, `0` disables transfer)
 
 ## Release
