@@ -423,8 +423,9 @@ function publishEndpoint(port: number): void {
 // human opened it (the data sat 15-48 h old) and the readers grew their own probes,
 // which is exactly what earned the 429s. Refresh every QUOTA_REFRESH_MS the accounts
 // whose reading is older than QUOTA_STALE_MS; 0 disables the timer (tests, one-shots).
-const QUOTA_STALE_MS = 10 * 60_000;
-const QUOTA_REFRESH_MS = Number(process.env.OPENCODE_CLAUDE_QUOTA_REFRESH_MS ?? 5 * 60_000);
+// 30 min (operator, 11-09-2026): the readers decide on the week's pace, not on the minute.
+const QUOTA_STALE_MS = 25 * 60_000;
+const QUOTA_REFRESH_MS = Number(process.env.OPENCODE_CLAUDE_QUOTA_REFRESH_MS ?? 30 * 60_000);
 let quotaRefreshInFlight: Promise<void> | null = null;
 let quotaTimer: ReturnType<typeof setInterval> | null = null;
 
