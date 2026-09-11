@@ -417,6 +417,69 @@ function publishEndpoint(port: number): void {
   }
 }
 
+// The ONE quota clock of the host (2026-09-11). Every other reader — the panel UI, the
+// dashboard's card, claude-rc-status, the company supervisor — reads the store this
+// writes; none of them asks Anthropic. Before this, the panel only re-probed when a
+// human opened it (the data sat 15-48 h old) and the readers grew their own probes,
+// which is exactly what earned the 429s. Refresh every QUOTA_REFRESH_MS the accounts
+// whose reading is older than QUOTA_STALE_MS; 0 disables the timer (tests, one-shots).
+const QUOTA_STALE_MS = 10 * 60_000;
+const QUOTA_REFRESH_MS = Number(process.env.OPENCODE_CLAUDE_QUOTA_REFRESH_MS ?? 5 * 60_000);
+let quotaRefreshInFlight: Promise<void> | null = null;
+let quotaTimer: ReturnType<typeof setInterval> | null = null;
+
+export async function refreshStaleQuotas(reason: string): Promise<void> {
+  if (quotaRefreshInFlight) return quotaRefreshInFlight;
+  quotaRefreshInFlight = (async () => {
+    const now = Date.now();
+    const stale = getAccounts().filter((account) => {
+      if (!credentialProbe(account)) return false;
+      const fetchedAt = getAccountQuota(account.id)?.fetchedAt ?? 0;
+      return now - fetchedAt > QUOTA_STALE_MS;
+    });
+    if (stale.length === 0) return;
+    log.info(
+      "[opencode-claude] quota refresh",
+      `reason=${reason} accounts=${stale.map((a) => a.id).join(",")}`,
+    );
+    const results = await Promise.allSettled(
+      stale.map(async (account) => {
+        await probeAccountQuota(account);
+        await fetchAccountIdentity(account).catch(() => null);
+      }),
+    );
+    // SC-51: allSettled must not swallow. probeAccountQuota already
+    // records its own failure into the store; this is the loud half —
+    // anything unexpected (fetch errors, identity crashes) surfaces as an
+    // error log AND a recorded refresh error instead of vanishing.
+    results.forEach((result, index) => {
+      if (result.status === "fulfilled") return;
+      const account = stale[index];
+      const message =
+        result.reason instanceof Error ? result.reason.message : String(result.reason);
+      log.error("[opencode-claude] quota refresh failed", `account=${account.id} ${message}`);
+      recordQuotaRefreshError(account.id, message);
+    });
+  })().finally(() => {
+    quotaRefreshInFlight = null;
+  });
+  return quotaRefreshInFlight;
+}
+
+function startQuotaClock(): void {
+  if (quotaTimer || !(QUOTA_REFRESH_MS > 0)) return;
+  quotaTimer = setInterval(() => {
+    refreshStaleQuotas("timer").catch((error) => {
+      log.error("[opencode-claude] quota clock tick failed", String(error));
+    });
+  }, QUOTA_REFRESH_MS);
+  // never keep the host process alive just for this
+  (quotaTimer as { unref?: () => void }).unref?.();
+  // first reading right away, so a fresh start does not wait a full interval
+  refreshStaleQuotas("startup").catch(() => null);
+  log.info("[opencode-claude] quota clock started", `every=${QUOTA_REFRESH_MS}ms stale>${QUOTA_STALE_MS}ms`);
+}
+
 export async function startProxy(tokenProvider: TokenProvider): Promise<number> {
   getAccessToken = tokenProvider;
   // Republish on every call, not just the first bind: the file is how a human
@@ -433,6 +496,7 @@ export async function startProxy(tokenProvider: TokenProvider): Promise<number> 
     if (await isProxyHealthyAt(pinnedUrl)) {
       proxyPort = REQUESTED_PROXY_PORT;
       publishEndpoint(proxyPort);
+      startQuotaClock();
       log.info(`[opencode-claude] reusing healthy proxy on ${pinnedUrl}`);
       return proxyPort;
     }
@@ -457,6 +521,7 @@ export async function startProxy(tokenProvider: TokenProvider): Promise<number> 
       throw new Error("Failed to bind Claude proxy to a port");
     }
     publishEndpoint(proxyPort);
+    startQuotaClock();
     // warn, not info: the panel URL is the one thing an operator has to be able
     // to find, and info is debug-gated.
     log.warn(
@@ -721,35 +786,7 @@ async function handlePanelRoutes(
     // all account-management mutations remain POST/DELETE and stay protected.
     // Normal 15s panel polling omits the flag, so it never spends quota.
     if (url.searchParams.get("refresh") === "stale") {
-      const now = Date.now();
-      const stale = getAccounts().filter((account) => {
-        if (!credentialProbe(account)) return false;
-        const fetchedAt = getAccountQuota(account.id)?.fetchedAt ?? 0;
-        return now - fetchedAt > 10 * 60_000;
-      });
-      const results = await Promise.allSettled(
-        stale.map(async (account) => {
-          await probeAccountQuota(account);
-          await fetchAccountIdentity(account).catch(() => null);
-        }),
-      );
-      // SC-51: allSettled must not swallow. probeAccountQuota already
-      // records its own failure into the store; this is the loud half —
-      // anything unexpected (fetch errors, identity crashes) surfaces as an
-      // error log AND a recorded refresh error instead of vanishing.
-      results.forEach((result, index) => {
-        if (result.status === "fulfilled") return;
-        const account = stale[index];
-        const message =
-          result.reason instanceof Error
-            ? result.reason.message
-            : String(result.reason);
-        log.error(
-          "[opencode-claude] quota refresh failed",
-          `account=${account.id} ${message}`,
-        );
-        recordQuotaRefreshError(account.id, message);
-      });
+      await refreshStaleQuotas("panel");
     }
     const counts = sessionCountsByAccount();
     return Response.json({

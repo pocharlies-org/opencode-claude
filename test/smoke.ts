@@ -3738,7 +3738,20 @@ async function main() {
   }
 
   restoreSuiteEnv();
-  console.log("ok — opencode-claude smoke tests passed");
+  // The ONE quota clock (2026-09-11): the refresh that the panel used to run only when a
+// human opened it is now a named, reentrant function the timer calls too. With no
+// probe-able accounts it must resolve quietly, and calling it twice concurrently must
+// share the same in-flight promise (no double probe, no double 429).
+{
+  const { refreshStaleQuotas } = await import("../src/proxy.ts");
+  assert.equal(typeof refreshStaleQuotas, "function");
+  const a = refreshStaleQuotas("smoke");
+  const b = refreshStaleQuotas("smoke");
+  assert.equal(a, b, "concurrent calls share one in-flight refresh");
+  await a;
+}
+
+console.log("ok — opencode-claude smoke tests passed");
 }
 
 main().catch((err) => {
