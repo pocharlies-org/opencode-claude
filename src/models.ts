@@ -54,6 +54,8 @@ const API_PRICING: Record<string, { input: number; output: number }> = {
   // Fable 5 and carries its list price until Anthropic says otherwise.
   "Fable 5.1": { input: 10, output: 50 },
   "Fable 5": { input: 10, output: 50 },
+  // Same for Opus 5.5 against Opus 5.
+  "Opus 5.5": { input: 5, output: 25 },
   "Opus 5": { input: 5, output: 25 },
   "Opus 4.8": { input: 5, output: 25 },
   "Sonnet 5": { input: 3, output: 15 },
@@ -116,8 +118,10 @@ function model(
 }
 
 const ALIAS_MODELS: ClaudeModel[] = [
-  model("fable", "Fable 5", LIMIT_1M),
-  model("opus", "Opus 5", LIMIT_1M),
+  // Claude Code 2.1.280 maps `fable` to claude-fable-5-1 and `opus` to
+  // claude-opus-5-5; older CLIs still serve Fable 5 / Opus 5 under these names.
+  model("fable", "Fable 5.1", LIMIT_1M),
+  model("opus", "Opus 5.5", LIMIT_1M),
   model("sonnet", "Sonnet 5", LIMIT_1M),
   model("haiku", "Haiku 4.5", LIMIT_200K, "claude-haiku-4-5"),
 ];
@@ -137,6 +141,7 @@ const ALIAS_MODELS: ClaudeModel[] = [
  */
 const PINNED_MODELS: ClaudeModel[] = [
   model("claude-fable-5-1", "Fable 5.1", LIMIT_1M, "claude-fable-5-1[1m]"),
+  model("claude-opus-5", "Opus 5", LIMIT_1M),
   model("claude-opus-4-8", "Opus 4.8", LIMIT_1M),
   model("claude-sonnet-4-6", "Sonnet 4.6", LIMIT_1M),
   model("claude-haiku-4-5", "Haiku 4.5", LIMIT_200K),

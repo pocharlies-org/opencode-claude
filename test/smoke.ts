@@ -2034,7 +2034,7 @@ async function main() {
           // carries an icon and the quota suffix.
           const catalog = models();
           const opus = catalog.find((m) => m.id === "opus")!;
-          assert.equal(opus.cost?.input, 5, "Opus 5 list price, $/1M in");
+          assert.equal(opus.cost?.input, 5, "Opus 5.5 list price, $/1M in");
           assert.equal(opus.cost?.output, 25);
           // Cache rates are multipliers on the INPUT rate, not flat numbers.
           assert.equal(opus.cost?.cache.read, 0.5, "reads bill at 0.1x input");
@@ -2112,7 +2112,7 @@ async function main() {
             );
             const opusOverlay = getCatalog().find((m) => m.id === "opus")!;
             assert.equal(opusOverlay.contextWindow, 200_000);
-            assert.equal(opusOverlay.name, "Opus 5", "keeps the shipped name");
+            assert.equal(opusOverlay.name, "Opus 5.5", "keeps the shipped name");
             assert.deepEqual(ids(), shipped, "an in-place edit does not reorder");
 
             writeFileSync(
