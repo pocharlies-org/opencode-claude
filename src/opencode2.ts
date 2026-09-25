@@ -12,6 +12,8 @@
  *   auth.methods          → ctx.integration.transform — CLI sync and browser OAuth
  *   chat.headers          → ctx.session.hook("model.request")
  *   chat.params           → ctx.session.hook("context")
+ *   (host compaction)     → ctx.session.hook("compaction"): answered locally,
+ *                           no model call (see compaction.ts)
  *   tool                  → ctx.tool.transform
  *   config.update refresh → ctx.provider.reload()
  *
@@ -69,6 +71,9 @@ import {
 import { defaultProviderName, providerNameForAccount } from "./provider-name.js";
 import { startProxy } from "./proxy.js";
 import { applyClaudeRequestContextHeaders } from "./request-context.js";
+import { claudeCodeCompactionCheckpoint } from "./compaction.js";
+import { rememberToolResult, toolResultText } from "./tool-results.js";
+import { extractTextContent } from "./prompt.js";
 import {
   isClaudeOAuthAuth,
   resolveAccessToken,
@@ -128,8 +133,26 @@ type V2Context = {
       name: "context",
       fn: (event: { model: ModelRef; options: Record<string, unknown> }) => void,
     ): Promise<Registration>;
+    hook(
+      name: "compaction",
+      fn: (event: {
+        model: ModelRef;
+        messages: Array<{ role?: string; content?: unknown }>;
+        result?: { summary: string; metadata?: Record<string, unknown> };
+      }) => void,
+    ): Promise<Registration>;
   };
   tool: {
+    hook(
+      name: "execute.after",
+      fn: (event: {
+        id: string;
+        sessionID: string;
+        status: "completed" | "error";
+        result?: unknown;
+        error?: unknown;
+      }) => void,
+    ): Promise<Registration>;
     transform(
       fn: (editor: {
         add(tool: {
@@ -316,6 +339,9 @@ async function waitForCliLogin(signalMs: number): Promise<ClaudeOAuthTokens> {
   throw new Error("No Claude Code CLI login found. Run `claude auth login`, then try again.");
 }
 
+/** Sessions this plugin has served a model call for (its tool results are kept). */
+const claudeSessions = new Set<string>();
+
 export function createV2Plugin(id = "opencode-claude") {
   return {
     id,
@@ -399,6 +425,7 @@ export function createV2Plugin(id = "opencode-claude") {
       await ctx.session.hook("model.request", (event) => {
         const providerID = event.model.providerID;
         if (!isClaudeProviderId(providerID)) return;
+        claudeSessions.add(String(event.sessionID));
         // Same routing rules as V1 chat.headers: the provider names the
         // account; a bare `claude-code` names none and leaves the session
         // where it is bound.
@@ -423,6 +450,37 @@ export function createV2Plugin(id = "opencode-claude") {
       await ctx.session.hook("context", (event) => {
         if (!isClaudeProviderId(event.model.providerID)) return;
         delete event.options.reasoningEffort;
+      });
+
+      // No host compaction for claude-code sessions (see compaction.ts): the
+      // context lives in Claude Code, which compacts it itself. Supplying the
+      // result makes V2 skip the model request — manual or automatic — and
+      // record a completed checkpoint instead of a failed turn.
+      await ctx.session.hook("compaction", (event) => {
+        if (!isClaudeProviderId(event.model.providerID)) return;
+        let latest = "";
+        for (let i = event.messages.length - 1; i >= 0 && !latest; i--) {
+          if (event.messages[i]?.role === "user") {
+            latest = extractTextContent(event.messages[i].content).trim();
+          }
+        }
+        event.result = {
+          summary: claudeCodeCompactionCheckpoint(latest),
+          metadata: { source: "opencode-claude", modelCall: false },
+        };
+      });
+
+      // Every tool result, kept for the proxy: a request after a mid-turn
+      // compaction no longer carries it, and without it the parked Claude turn
+      // re-emits the call and the host runs the tool twice (tool-results.ts).
+      await ctx.tool.hook("execute.after", (event) => {
+        // Only claude-code sessions: other providers' tool output is none of
+        // this plugin's business.
+        if (!claudeSessions.has(String(event.sessionID))) return;
+        rememberToolResult(
+          String(event.id),
+          toolResultText(event.status === "completed" ? event.result : undefined, event.status === "error" ? event.error ?? "tool failed" : undefined),
+        );
       });
 
       const tools = buildAccountTools();

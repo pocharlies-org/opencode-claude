@@ -503,6 +503,61 @@ async function main() {
     assert.equal(detectMetaRequestKind(titleMessages, null), "title");
   }
 
+  // Host compaction for claude-code is answered locally (compaction.ts)
+  {
+    const { localSummaryAnswer, claudeCodeCompactionCheckpoint } = await import(
+      "../src/compaction.ts"
+    );
+    const { hostUsageFromTurnTotal } = await import("../src/usage.ts");
+    const checkpoint = claudeCodeCompactionCheckpoint("fix the parser");
+    for (const heading of [
+      "## Objective",
+      "## Requirements",
+      "## Decisions",
+      "## Work State",
+      "## Next Move",
+      "## Relevant Files",
+      "## Important Context",
+    ]) {
+      assert.ok(checkpoint.split("\n").includes(heading), `checkpoint has ${heading}`);
+    }
+    assert.match(checkpoint, /fix the parser/);
+    // OpenCode 2's compaction prompt carries the template → checkpoint built
+    // from the request before it.
+    const v2Compaction = localSummaryAnswer([
+      { role: "user", content: "rename the flag" },
+      { role: "assistant", content: "Renamed." },
+      { role: "user", content: "You MUST summarize...\n<template>\n## Objective\n- [..]" },
+    ]);
+    assert.match(v2Compaction, /^## Objective\n- rename the flag/);
+    // OpenCode 2's session summary → opening of the last reply.
+    assert.equal(
+      localSummaryAnswer([
+        { role: "system", content: "Summarize what was done in this conversation. Write like a pull request description." },
+        { role: "user", content: "go" },
+        { role: "assistant", content: "I renamed the flag and updated the docs." },
+      ]),
+      "I renamed the flag and updated the docs.",
+    );
+    // Anything else (OpenCode 1's compaction) → the plain note, never
+    // "Summary unavailable".
+    assert.match(
+      localSummaryAnswer([
+        { role: "system", content: "You are tasked with summarizing conversations" },
+        { role: "user", content: "summarize" },
+      ]),
+      /kept by Claude Code/,
+    );
+    const total = hostUsageFromTurnTotal({
+      prompt_tokens: 4,
+      completion_tokens: 9,
+      total_tokens: 13,
+      prompt_tokens_details: { cached_tokens: 1000, cache_write_tokens: 50 },
+    });
+    assert.equal(total.prompt_tokens, 1054);
+    assert.equal(total.total_tokens, 1063);
+  }
+
   // Logger: errors always emit; info is debug-gated; durable file mirror
   {
     const { spawnSync } = await import("node:child_process");
@@ -890,6 +945,185 @@ async function main() {
       const sysPrompt = seenParams.systemPrompt as { append?: string };
       assert.match(sysPrompt.append ?? "", /mcp__opencode__todowrite/);
       assert.match(sysPrompt.append ?? "", /[Bb]atch independent tool calls/);
+
+      // Host usage = this response's LAST API call as context (input + cache
+      // read + cache write, OpenAI-style prompt_tokens) and the output of every
+      // call in it — not the SDK result's sum over the tool loop, which read
+      // as N×context and made OpenCode 2 compact claude-code sessions.
+      setClaudeQueryStarter(async () => {
+        const events = [
+          { type: "system", subtype: "init", session_id: "mock-sess-usage" },
+          {
+            type: "stream_event",
+            parent_tool_use_id: null,
+            event: {
+              type: "message_start",
+              message: {
+                id: "msg_call_1",
+                usage: {
+                  input_tokens: 3,
+                  cache_read_input_tokens: 100_000,
+                  cache_creation_input_tokens: 500,
+                  output_tokens: 1,
+                },
+              },
+            },
+          },
+          {
+            type: "stream_event",
+            event: { type: "message_delta", usage: { output_tokens: 40 } },
+          },
+          {
+            type: "stream_event",
+            event: {
+              type: "message_start",
+              message: {
+                id: "msg_call_2",
+                usage: {
+                  input_tokens: 2,
+                  cache_read_input_tokens: 100_500,
+                  cache_creation_input_tokens: 300,
+                  output_tokens: 1,
+                },
+              },
+            },
+          },
+          {
+            type: "stream_event",
+            event: {
+              type: "content_block_delta",
+              delta: { type: "text_delta", text: "USAGE_OK" },
+            },
+          },
+          {
+            type: "stream_event",
+            event: { type: "message_delta", usage: { output_tokens: 25 } },
+          },
+          // A subagent's call runs in its own context: not this one's size.
+          {
+            type: "stream_event",
+            parent_tool_use_id: "toolu_sub",
+            event: {
+              type: "message_start",
+              message: {
+                id: "msg_sub",
+                usage: { input_tokens: 9, cache_read_input_tokens: 900_000 },
+              },
+            },
+          },
+          {
+            type: "result",
+            is_error: false,
+            modelUsage: {
+              "claude-sonnet-5": {
+                inputTokens: 5,
+                outputTokens: 65,
+                cacheReadInputTokens: 200_500,
+                cacheCreationInputTokens: 800,
+                costUSD: 0.1,
+              },
+            },
+          },
+        ];
+        return {
+          stream: (async function* () {
+            for (const ev of events) yield ev;
+          })(),
+          interrupt: async () => {},
+          close: () => {},
+          getPid: () => null,
+        };
+      });
+      for (const streamed of [false, true]) {
+        const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-opencode-claude-session": `smoke-usage-${streamed}`,
+          },
+          body: JSON.stringify({
+            model: "sonnet",
+            stream: streamed,
+            stream_options: { include_usage: true },
+            messages: [{ role: "user", content: "count" }],
+          }),
+        });
+        assert.equal(res.status, 200);
+        let hostUsage: Record<string, any> | undefined;
+        if (streamed) {
+          const text = await res.text();
+          assert.match(text, /USAGE_OK/);
+          for (const line of text.split("\n")) {
+            if (!line.startsWith("data: {")) continue;
+            const chunk = JSON.parse(line.slice(6));
+            if (chunk.usage) hostUsage = chunk.usage;
+          }
+        } else {
+          hostUsage = ((await res.json()) as { usage?: Record<string, any> }).usage;
+        }
+        assert.equal(hostUsage?.prompt_tokens, 2 + 100_500 + 300, `context of the last call (stream=${streamed})`);
+        assert.equal(hostUsage?.prompt_tokens_details?.cached_tokens, 100_500);
+        assert.equal(hostUsage?.prompt_tokens_details?.cache_write_tokens, 300);
+        assert.equal(hostUsage?.completion_tokens, 40 + 25, "output of every call");
+      }
+
+      // A parked turn whose next request lost the tool result (OpenCode 2
+      // compacting mid-turn sends recent history as text) resumes with the
+      // result the host recorded, instead of re-emitting the call — which made
+      // the host run the tool a second time.
+      {
+        const { putBridge, deleteBridge } = await import("../src/bridge-pool.ts");
+        const { rememberToolResult } = await import("../src/tool-results.ts");
+        let resolvedWith: string | null = null;
+        putBridge({
+          id: "bridge-remembered",
+          conversationKey: "smoke-remembered",
+          handle: { stream: (async function* () {})(), interrupt: async () => {}, close: () => {}, getPid: () => null, readPlanUsage: async () => null },
+          pendingTools: new Map([
+            [
+              "call_remembered",
+              {
+                id: "call_remembered",
+                name: "bash",
+                arguments: "{}",
+                resolve: (text: string) => {
+                  resolvedWith = text;
+                },
+                reject: () => {},
+              },
+            ],
+          ]),
+          createdAt: Date.now(),
+          continueStream: () =>
+            (async function* () {
+              yield {
+                type: "stream_event",
+                event: { type: "content_block_delta", delta: { type: "text_delta", text: "RESUMED" } },
+              };
+              yield { type: "result", is_error: false, usage: { input_tokens: 1, output_tokens: 1 } };
+            })(),
+        } as never);
+        rememberToolResult("call_remembered", "remembered-output");
+        const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-opencode-claude-session": "smoke-remembered",
+          },
+          body: JSON.stringify({
+            model: "sonnet",
+            stream: false,
+            messages: [
+              { role: "user", content: "## Objective\n- ...\n[Tool result]: remembered-output" },
+            ],
+          }),
+        });
+        const json = (await res.json()) as { choices?: Array<{ message?: Record<string, unknown> }> };
+        assert.equal(resolvedWith, "remembered-output");
+        assert.match(String(json.choices?.[0]?.message?.content ?? ""), /RESUMED/);
+        assert.equal(json.choices?.[0]?.message?.tool_calls, undefined, "no re-emitted call");
+        deleteBridge("bridge-remembered");
+      }
 
       // Proxy + mock SDK: hard limit error BEFORE any content — the proxy
       // must answer with a truthful HTTP 429 (not a fake-200 error stream),
@@ -3778,6 +4012,7 @@ async function main() {
     const providers = new Map<string, { provider: any; models: any[] }>();
     const tools = new Map<string, any>();
     const hooks = new Map<string, (event: any) => void>();
+    const toolHooks = new Map<string, (event: any) => void>();
     const methods: any[] = [];
     const registration = { dispose: async () => {} };
     const ctx = {
@@ -3802,6 +4037,10 @@ async function main() {
       tool: {
         transform: async (fn: (editor: any) => void) => {
           fn({ add: (t: any) => tools.set(t.name, t) });
+          return registration;
+        },
+        hook: async (name: string, fn: (event: any) => void) => {
+          toolHooks.set(name, fn);
           return registration;
         },
       },
@@ -3863,6 +4102,49 @@ async function main() {
         headers: foreign,
       });
       assert.deepEqual(foreign, {}, "other providers are left alone");
+
+      const compactionEvent: Record<string, any> = {
+        model: { id: "opus", providerID: "claude-code-work" },
+        messages: [
+          { role: "user", content: [{ type: "text", text: "migrate the db" }] },
+          { role: "assistant", content: [{ type: "text", text: "done" }] },
+        ],
+      };
+      hooks.get("compaction")!(compactionEvent);
+      assert.match(compactionEvent.result?.summary ?? "", /^## Objective\n- migrate the db/);
+      assert.match(compactionEvent.result?.summary ?? "", /## Important Context/);
+      const foreignCompaction: Record<string, any> = {
+        model: { id: "tooling", providerID: "litellm-local" },
+        messages: [],
+      };
+      hooks.get("compaction")!(foreignCompaction);
+      assert.equal(foreignCompaction.result, undefined, "other providers compact normally");
+
+      // Tool results of claude-code sessions are kept for the proxy, which
+      // uses them when a request after a mid-turn compaction lost them.
+      const { takeToolResult } = await import("../src/tool-results.ts");
+      toolHooks.get("execute.after")!({
+        id: "call_v2_1",
+        sessionID: "ses_v2",
+        status: "completed",
+        result: { content: [{ type: "text", text: "hola" }] },
+      });
+      assert.equal(takeToolResult("call_v2_1"), "hola");
+      assert.equal(takeToolResult("call_v2_1"), undefined, "forgotten once read");
+      toolHooks.get("execute.after")!({
+        id: "call_v2_2",
+        sessionID: "ses_v2",
+        status: "error",
+        error: { message: "exit 1" },
+      });
+      assert.equal(takeToolResult("call_v2_2"), "Error: exit 1");
+      toolHooks.get("execute.after")!({
+        id: "call_other",
+        sessionID: "ses_never_claude",
+        status: "completed",
+        result: { content: "secret" },
+      });
+      assert.equal(takeToolResult("call_other"), undefined, "other providers' output is not kept");
 
       const options: Record<string, unknown> = { reasoningEffort: "high", temperature: 1 };
       hooks.get("context")!({ model: { id: "opus", providerID: "claude-code" }, options });
