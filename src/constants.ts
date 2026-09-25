@@ -73,6 +73,14 @@ export const DIRECTORY_HEADER = "x-opencode-claude-directory";
  */
 export const ACCOUNT_HEADER = "x-opencode-claude-account";
 
+/**
+ * What kind of request this is, when the host says so. OpenCode 2 tells its
+ * plugins whether a model call is the agent loop, a title or a compaction;
+ * OpenCode 1 never does, so its requests keep going through the prompt
+ * heuristics in request-kind.ts. Values: `title` | `summary`.
+ */
+export const KIND_HEADER = "x-opencode-claude-kind";
+
 /** Separates a model id from its account: `opus@work`. */
 export const ACCOUNT_MODEL_SEPARATOR = "@";
 

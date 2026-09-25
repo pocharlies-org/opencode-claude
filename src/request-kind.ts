@@ -61,9 +61,19 @@ export function isSummaryGenerationRequest(messages: MessageLike[]): boolean {
   );
 }
 
+/**
+ * `hinted` is the host's own word for the request (the KIND_HEADER). It can
+ * only ever promote a request to a meta request: OpenCode 2 runs its summary
+ * agent as an ordinary session call, and that one is still recognised by its
+ * prompt. OpenCode 2's compaction prompt matches none of the phrases below,
+ * which is why the hint exists at all — without it a compaction ran as a full
+ * Claude Code agent turn.
+ */
 export function detectMetaRequestKind(
   messages: MessageLike[],
+  hinted?: string | null,
 ): MetaRequestKind {
+  if (hinted === "title" || hinted === "summary") return hinted;
   if (isTitleGenerationRequest(messages)) return "title";
   if (isSummaryGenerationRequest(messages)) return "summary";
   return null;

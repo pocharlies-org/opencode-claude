@@ -69,7 +69,8 @@ async function main() {
   const { applyClaudeRequestContextHeaders } = await import(
     "../src/request-context.ts"
   );
-  const { ClaudeCodePlugin } = await import("../src/index.ts");
+  const pluginModule = await import("../src/index.ts");
+  const ClaudeCodePlugin = pluginModule.default.server;
   const {
     startProxy,
     stopProxy,
@@ -494,6 +495,12 @@ async function main() {
       { role: "user", content: "fix a bug" },
     ];
     assert.equal(detectMetaRequestKind(normalMessages), null);
+    // The host's own word (KIND_HEADER, OpenCode 2) promotes a request its
+    // prompt would not give away; it never demotes one the prompt does.
+    assert.equal(detectMetaRequestKind(normalMessages, "summary"), "summary");
+    assert.equal(detectMetaRequestKind(normalMessages, "title"), "title");
+    assert.equal(detectMetaRequestKind(normalMessages, "primary"), null);
+    assert.equal(detectMetaRequestKind(titleMessages, null), "title");
   }
 
   // Logger: errors always emit; info is debug-gated; durable file mirror
@@ -548,8 +555,18 @@ async function main() {
     assert.match(fileBody, /DEBUG_INFO/);
   }
 
-  // Plugin export
+  // Plugin export: one dual default, nothing else a host could run as a plugin.
   assert.equal(typeof ClaudeCodePlugin, "function");
+  assert.equal(pluginModule.default.id, "opencode-claude");
+  assert.equal(typeof pluginModule.default.setup, "function");
+  assert.deepEqual(
+    Object.entries(pluginModule).filter(([, v]) => typeof v === "function").map(([k]) => k),
+    [],
+  );
+  {
+    const entry = await import("../opencode-claude.js").catch(() => null);
+    if (entry) assert.deepEqual(Object.keys(entry), ["default"]);
+  }
   const requestHeaders: Record<string, string> = {};
   applyClaudeRequestContextHeaders(
     requestHeaders,
@@ -3725,6 +3742,172 @@ async function main() {
 
   await stopProxy();
   setClaudeCredentialProbe(null);
+
+  // OpenCode 2 entry: the same provider, headers, tools and login methods,
+  // registered through the V2 plugin API against a recording fake host.
+  {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const { tmpdir } = await import("node:os");
+    const { resetAccounts } = await import("../src/accounts.ts");
+    const { decodeClaudeModelSelection } = await import("../src/model-selection.ts");
+    const v2Dir = mkdtempSync(join(tmpdir(), "oc-claude-v2-"));
+    const prev = {
+      xdg: process.env.XDG_DATA_HOME,
+      home: process.env.HOME,
+      accounts: process.env.OPENCODE_CLAUDE_ACCOUNTS,
+    };
+    process.env.XDG_DATA_HOME = join(v2Dir, "data");
+    // No ambient Claude home: the catalog must come from the plugin's own
+    // auth.json entry, and nothing real gets synced into the fixture.
+    process.env.HOME = join(v2Dir, "home");
+    delete process.env.OPENCODE_CLAUDE_ACCOUNTS;
+    mkdirSync(join(v2Dir, "data", "opencode"), { recursive: true });
+    writeFileSync(
+      join(v2Dir, "data", "opencode", "auth.json"),
+      JSON.stringify({
+        "claude-code": {
+          type: "oauth",
+          access: "v2-access",
+          refresh: "cli-sync-v2",
+          expires: Date.now() + 3_600_000,
+        },
+      }),
+    );
+    resetAccounts();
+    const providers = new Map<string, { provider: any; models: any[] }>();
+    const tools = new Map<string, any>();
+    const hooks = new Map<string, (event: any) => void>();
+    const methods: any[] = [];
+    const registration = { dispose: async () => {} };
+    const ctx = {
+      options: {},
+      location: { directory: "/data/projects/v2" },
+      provider: {
+        transform: async (fn: (editor: any) => void) => {
+          fn({
+            get: (id: string) => providers.get(id),
+            add: (d: any) => providers.set(d.info.id, { provider: d.info, models: d.models }),
+          });
+          return registration;
+        },
+        reload: async () => {},
+      },
+      session: {
+        hook: async (name: string, fn: (event: any) => void) => {
+          hooks.set(name, fn);
+          return registration;
+        },
+      },
+      tool: {
+        transform: async (fn: (editor: any) => void) => {
+          fn({ add: (t: any) => tools.set(t.name, t) });
+          return registration;
+        },
+      },
+      integration: {
+        transform: async (fn: (editor: any) => void) => {
+          fn({ update: () => {}, method: { update: (m: any) => methods.push(m) } });
+          return registration;
+        },
+      },
+    };
+    try {
+      await pluginModule.default.setup(ctx as never);
+
+      const provider = providers.get("claude-code");
+      assert.ok(provider, "V2 registers the claude-code provider");
+      assert.equal(provider.provider.package, "aisdk:@ai-sdk/openai-compatible");
+      assert.equal(provider.provider.activation, "enabled");
+      assert.match(provider.provider.settings.baseURL, /^http:\/\/127\.0\.0\.1:\d+\/v1$/);
+      assert.equal(provider.provider.settings.includeUsage, true);
+      assert.ok(provider.models.some((m) => m.id === "sonnet"));
+      assert.ok(provider.models.every((m) => m.providerID === "claude-code"));
+      assert.ok(!provider.models.some((m) => m.id === "login"), "real catalog, not the placeholder");
+      const opus = provider.models.find((m) => m.id === "opus");
+      assert.ok(opus, "opus in the V2 catalog");
+      assert.ok(opus.variants.some((v: { id: string }) => v.id === "high"));
+      assert.ok(opus.variants.every((v: { id: string }) => v.id !== "none"));
+      const health = await fetch(`${provider.provider.settings.baseURL.replace(/\/v1$/, "")}/health`);
+      assert.equal(health.status, 200, "V2 setup brings the proxy up");
+
+      const headers: Record<string, string> = {};
+      hooks.get("model.request")!({
+        sessionID: "ses_v2",
+        agent: "build",
+        kind: "title",
+        model: { id: "opus", providerID: "claude-code", variant: "high" },
+        headers,
+      });
+      assert.equal(headers["x-opencode-claude-directory"], "/data/projects/v2");
+      assert.equal(headers["x-opencode-claude-session"], "ses_v2");
+      assert.equal(headers["x-opencode-claude-kind"], "title");
+      assert.equal(headers["x-opencode-claude-account"], undefined);
+      const decoded = decodeClaudeModelSelection(headers["x-opencode-claude-effort"]);
+      assert.equal(decoded?.modelId, "opus");
+      assert.equal(decoded?.effort, "high");
+      const compaction: Record<string, string> = {};
+      hooks.get("model.request")!({
+        sessionID: "ses_v2",
+        kind: "compaction",
+        model: { id: "sonnet", providerID: "claude-code-work" },
+        headers: compaction,
+      });
+      assert.equal(compaction["x-opencode-claude-kind"], "summary");
+      assert.equal(compaction["x-opencode-claude-account"], "work");
+      const foreign: Record<string, string> = {};
+      hooks.get("model.request")!({
+        sessionID: "ses_v2",
+        kind: "primary",
+        model: { id: "tooling", providerID: "litellm-local" },
+        headers: foreign,
+      });
+      assert.deepEqual(foreign, {}, "other providers are left alone");
+
+      const options: Record<string, unknown> = { reasoningEffort: "high", temperature: 1 };
+      hooks.get("context")!({ model: { id: "opus", providerID: "claude-code" }, options });
+      assert.equal("reasoningEffort" in options, false);
+      assert.equal(options.temperature, 1);
+
+      assert.ok(tools.has("claude_accounts"));
+      assert.ok(tools.has("claude_account_manage"));
+      assert.equal(tools.get("claude_account_manage").input.type, "object");
+      assert.equal(tools.get("claude_accounts").options?.codemode, false, "direct tool, as on V1");
+      const toolContext = {
+        sessionID: "ses_v2",
+        messageID: "msg_v2",
+        agent: "build",
+        id: "call_v2",
+        signal: new AbortController().signal,
+      };
+      const listed = await tools.get("claude_accounts").execute({}, toolContext);
+      assert.equal(typeof listed.content, "string");
+      assert.match(listed.metadata?.title ?? "", /connected/);
+      const refused = await tools.get("claude_account_manage").execute({ action: "use" }, toolContext);
+      assert.match(refused.content, /^Error: .*needs an account id/);
+
+      assert.deepEqual(
+        methods.map((m) => m.method.id),
+        ["claude-cli", "claude-browser"],
+      );
+      assert.ok(
+        methods.every((m) => m.integrationID === "claude-code" && !("refresh" in m)),
+        "V2 must never get a refresh hook: the chain has one owner",
+      );
+    } finally {
+      await stopProxy();
+      for (const [key, value] of [
+        ["XDG_DATA_HOME", prev.xdg],
+        ["HOME", prev.home],
+        ["OPENCODE_CLAUDE_ACCOUNTS", prev.accounts],
+      ] as const) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      resetAccounts();
+      rmSync(v2Dir, { recursive: true, force: true });
+    }
+  }
 
   // TypeScript build
   const build = spawnSync("bun", ["run", "build"], {

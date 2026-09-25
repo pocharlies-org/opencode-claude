@@ -63,6 +63,25 @@ bun install && bun run build
 opencode plugin file://$PWD
 ```
 
+### OpenCode 2
+
+The same package loads in OpenCode 1 and OpenCode 2 (one dual default export:
+V2 runs `setup`, V1 runs `server`). On V2 a plugin configured by path must be
+the **directory** — V2 looks for `index.js` inside it and ignores a path to a
+single `.js` file ("configured plugin path must be a directory"):
+
+```jsonc
+{ "plugin": ["file:///path/to/opencode-claude"] }
+```
+
+V1 accepts that same directory entry, so one config serves both. Two V2
+differences to know:
+
+- `enabled_providers` becomes a policy in V2 and a plugin cannot extend it, so
+  with multiple accounts list the per-account providers too
+  (`"claude-code-*"`; V1 ignores an id it does not know).
+- A `provider.claude-code.name` in config wins over the name the plugin sets.
+
 ## Authenticate
 
 Requires the plugin to be installed (see above).
