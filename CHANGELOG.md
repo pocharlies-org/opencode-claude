@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **OpenCode 2 support, same package.** The default export is now dual
+  (`{ id, setup, server }`): OpenCode 2 runs `setup` (src/opencode2.ts), OpenCode 1
+  keeps running the unchanged V1 plugin as `server`. On V2 the provider and its
+  per-account siblings come from `provider.transform`, the selection/account/
+  directory/session headers from `session.hook("model.request")`, the account tools
+  are direct tools (not Code Mode), and the CLI/browser logins are integration
+  methods — without a `refresh`, so the token chain keeps a single owner. The
+  proxy, panel and token resolver are shared, not reimplemented.
+  - V2 tells the proxy what a request is for (`x-opencode-claude-kind`): its
+    compaction prompt defeats the title/summary heuristics, and without the hint
+    it ran as a full agent turn. OpenCode 1 never sends it.
+  - `index.js` at the package root: V2 loads a path plugin only as a directory
+    and looks for `index.js` in it. Both entry files export ONLY the default —
+    OpenCode 1 runs every exported function as a plugin.
+- **`refreshStaleQuotas` returns the shared in-flight promise.** It was `async`,
+  so concurrent callers each got a fresh wrapper and the smoke test pinning the
+  reentrancy failed on `main`.
+
 - **The accounts panel refreshes stale quota when opened.** Connected accounts
   whose last quota sample is over ten minutes old are probed once per page load;
   active accounts still get free updates from normal request headers. Each probe

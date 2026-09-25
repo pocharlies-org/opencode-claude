@@ -109,6 +109,7 @@ import { parseAccountModelId, resolveClaudeModelId } from "./models.js";
 import {
   ACCOUNT_HEADER,
   DIRECTORY_HEADER,
+  KIND_HEADER,
   LOOPBACK_CALLBACK_PATH,
   SESSION_HEADER,
   type ClaudeEffort,
@@ -429,7 +430,10 @@ const QUOTA_REFRESH_MS = Number(process.env.OPENCODE_CLAUDE_QUOTA_REFRESH_MS ?? 
 let quotaRefreshInFlight: Promise<void> | null = null;
 let quotaTimer: ReturnType<typeof setInterval> | null = null;
 
-export async function refreshStaleQuotas(reason: string): Promise<void> {
+// Not `async`: an async function wraps whatever it returns in a fresh promise,
+// so two concurrent callers got two different promises even though they
+// shared one refresh — the reentrancy the smoke test pins was not observable.
+export function refreshStaleQuotas(reason: string): Promise<void> {
   if (quotaRefreshInFlight) return quotaRefreshInFlight;
   quotaRefreshInFlight = (async () => {
     const now = Date.now();
@@ -1364,7 +1368,10 @@ async function handleChatCompletions(
   body: ChatCompletionRequest,
 ): Promise<Response> {
   const messages = Array.isArray(body.messages) ? body.messages : [];
-  const metaKind = detectMetaRequestKind(messages);
+  const metaKind = detectMetaRequestKind(
+    messages,
+    req.headers.get(KIND_HEADER)?.trim().toLowerCase(),
+  );
   const sessionHeader = req.headers.get(SESSION_HEADER);
   /** Identity of the chat itself, shared by the turn and its meta requests. */
   const sessionKey = sessionHeader || conversationKeyFromMessages(messages);

@@ -10,15 +10,10 @@
  *   { "plugin": ["@otto-assistant/opencode-claude"] }
  */
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
-import {
-  refreshClaudeToken,
-  RefreshTokenInvalidError,
-  type ClaudeOAuthTokens,
-} from "./auth.js";
+import { type ClaudeOAuthTokens } from "./auth.js";
 import {
   completeClaudeBrowserLogin,
   getPendingClaudeLogin,
-  isCliOwnedRefreshToken,
   readStoredClaudeOAuth,
   resetPendingClaudeLogin,
   startClaudeBrowserLogin,
@@ -36,15 +31,13 @@ import {
 } from "./constants.js";
 import { applyClaudeRequestContextHeaders } from "./request-context.js";
 import {
-  accountIcon,
   configureAccounts,
   getAccounts,
   getDefaultAccount,
   isMultiAccount,
-  type ClaudeAccount,
 } from "./accounts.js";
-import { readClaudeCliOAuthCredentials } from "./credentials.js";
-import { getAccountIdentity } from "./identity.js";
+import { defaultProviderName, providerNameForAccount } from "./provider-name.js";
+import { resolveAccessToken, resolveScopedAccountToken } from "./token.js";
 import { detectClaudeCode } from "./detect.js";
 import { log } from "./log.js";
 import {
@@ -66,24 +59,8 @@ import {
   startProxy,
 } from "./proxy.js";
 import { buildAccountTools } from "./tools.js";
+import { createV2Plugin } from "./opencode2.js";
 import { setHostCatalogRefresher } from "./host-refresh.js";
-
-type ClaudeOAuthAuth = {
-  type: "oauth";
-  access?: string;
-  refresh: string;
-  expires: number;
-};
-
-function isClaudeOAuthAuth(auth: unknown): auth is ClaudeOAuthAuth {
-  return (
-    !!auth &&
-    typeof auth === "object" &&
-    (auth as { type?: unknown }).type === "oauth" &&
-    typeof (auth as { refresh?: unknown }).refresh === "string" &&
-    typeof (auth as { expires?: unknown }).expires === "number"
-  );
-}
 
 /**
  * What the turn WOULD cost on an API key, $/1M tokens.
@@ -186,27 +163,6 @@ function buildProviderModel(
     release_date: "",
     variants,
   };
-}
-
-/**
- * Provider name for an account: label plus the Claude login behind it.
- *
- * The host shows this under the model name when hovering, and as the group
- * header in the picker — the one place where "which subscription am I about to
- * spend" can be answered before spending it. The label alone does not answer
- * it: labels are operator-chosen and go stale the moment a Claude home is
- * re-logged to a different account, which is exactly when the question matters.
- */
-function providerNameForAccount(account: ClaudeAccount): string {
-  const email = getAccountIdentity(account.id)?.email;
-  const label = account.label.trim();
-  // Do not repeat the address when the operator already named the account after
-  // it, which is a natural thing to do.
-  const showEmail = email && !label.toLowerCase().includes(email.toLowerCase());
-  // The icon leads, matching the model rows underneath: the group header is the
-  // legend that says which account a glyph stands for.
-  const icon = isMultiAccount() ? `${accountIcon(account)} ` : "";
-  return `${icon}Claude Code · ${label}${showEmail ? ` · ${email}` : ""}`;
 }
 
 function buildConfigModelEntry(model: ClaudeModel): Record<string, unknown> {
@@ -351,24 +307,9 @@ function ensureClaudeProviderConfig(
     };
   }
 
-  // In multi-account mode every provider names its account, this one included:
-  // a group headed by a bare "Claude Code" beside three labelled ones reads as
-  // the odd one out rather than as the default account. A name the operator
-  // genuinely customised is still respected.
-  const defaultAccountLabel = getDefaultAccount().label;
-  const customName =
-    typeof existing.name === "string" &&
-    existing.name.trim() &&
-    existing.name.trim() !== "Claude Code"
-      ? existing.name.trim()
-      : "";
   config.provider[PROVIDER_ID] = {
     ...existing,
-    name:
-      customName ||
-      (isMultiAccount()
-        ? "Claude Code · this session’s account"
-        : "Claude Code"),
+    name: defaultProviderName(existing.name),
     npm: existing.npm ?? OPENAI_COMPATIBLE_NPM,
     options: {
       apiKey: "claude-code-proxy",
@@ -383,167 +324,6 @@ function ensureClaudeProviderConfig(
       ...existingModels,
     },
   };
-}
-
-/**
- * Refresh the access token a little BEFORE it dies so turns never start with
- * a token that expires mid-flight. The 8h access-token TTL itself is fixed
- * Anthropic-side; what keeps the session alive indefinitely is a refresh
- * chain that never breaks.
- */
-const REFRESH_MARGIN_MS = 120_000;
-
-/**
- * In-flight refresh dedupe, keyed by refresh token. OpenCode fires the main
- * turn and the title meta request in parallel — without single-flight both
- * refresh with the SAME token, Anthropic rotates on the first, and the
- * second dies with invalid_grant, killing the whole chain (this exact race
- * burned quota on 2026-08-11).
- */
-const refreshInFlight = new Map<string, Promise<string | null>>();
-
-/**
- * Access token for an account that owns its own Claude home.
- *
- * Deliberately read-only: the CLI living in that config dir is the sole owner
- * of its refresh chain, and rotating it from here is exactly the two-owner
- * replay that gets the whole grant revoked (see auth-login.ts). An expired
- * token yields null, which makes the proxy spawn the CLI WITHOUT
- * CLAUDE_CODE_OAUTH_TOKEN so the CLI refreshes its own credentials file.
- */
-function resolveScopedAccountToken(account: ClaudeAccount): string | null {
-  const creds = readClaudeCliOAuthCredentials({ configDir: account.configDir });
-  if (!creds?.accessToken) return null;
-  if (creds.expiresAt && creds.expiresAt <= Date.now() + 30_000) {
-    log.info("[opencode-claude] account token expired; letting the CLI refresh", {
-      account: account.id,
-    });
-    return null;
-  }
-  return creds.accessToken;
-}
-
-async function resolveAccessToken(
-  input: PluginInput,
-  getAuth: () => Promise<unknown>,
-  account?: ClaudeAccount,
-): Promise<string | null> {
-  // Accounts pinned to their own Claude home never touch auth.json: that file
-  // has exactly one `claude-code` slot, and sharing it across subscriptions
-  // would hand one account's token to another.
-  if (account?.configDir) return resolveScopedAccountToken(account);
-  let auth = await getAuth();
-  // The host's in-memory auth store can lag auth.json (tokens written by a
-  // sibling process, a headless login, or a race at server start). When the
-  // host hands us nothing usable, trust the fresher on-disk entry instead of
-  // falling into the logged-out placeholder path.
-  if (
-    !isClaudeOAuthAuth(auth) ||
-    !(auth.access && auth.expires > Date.now() + REFRESH_MARGIN_MS)
-  ) {
-    const stored = readStoredClaudeOAuth();
-    if (
-      stored &&
-      (!isClaudeOAuthAuth(auth) || stored.expires > (auth.expires ?? 0))
-    ) {
-      auth = { type: "oauth", ...stored };
-    }
-  }
-  if (isClaudeOAuthAuth(auth)) {
-    if (auth.access && auth.expires > Date.now() + REFRESH_MARGIN_MS) {
-      return auth.access;
-    }
-    // CLI-owned chains are never rotated through the token endpoint by us
-    // (rotation belongs to the CLI — see isCliOwnedRefreshToken); re-sync
-    // from the CLI file instead.
-    if (isCliOwnedRefreshToken(auth.refresh)) {
-      const synced = syncClaudeCliCredentialsToOpenCode();
-      if (synced) return synced.access;
-      // Only hand out the stored access token while it is genuinely valid —
-      // an expired token spawns a doomed turn (401) and blocks CLI self-heal.
-      return auth.access && auth.expires > Date.now() ? auth.access : null;
-    }
-
-    const key = auth.refresh;
-    let pending = refreshInFlight.get(key);
-    if (!pending) {
-      pending = (async () => {
-        try {
-          const refreshed = await refreshClaudeToken(key);
-          await input.client.auth.set({
-            path: { id: PROVIDER_ID },
-            body: {
-              type: "oauth",
-              refresh: refreshed.refresh,
-              access: refreshed.access,
-              expires: refreshed.expires,
-            },
-          });
-          return refreshed.access;
-        } catch (err) {
-          const permanent = err instanceof RefreshTokenInvalidError;
-          log.error(
-            `[opencode-claude] token refresh ${permanent ? "rejected" : "failed"}: ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          );
-          if (permanent) {
-            // invalid_grant usually means another actor (claude CLI, a
-            // parallel refresh) rotated the token first. Re-read the store:
-            // fresher credentials may already be there.
-            try {
-              const latest = await getAuth();
-              if (
-                isClaudeOAuthAuth(latest) &&
-                latest.refresh !== key &&
-                latest.access &&
-                latest.expires > Date.now() + REFRESH_MARGIN_MS
-              ) {
-                log.info(
-                  "[opencode-claude] recovered newer OAuth credentials after refresh rejection",
-                );
-                return latest.access;
-              }
-            } catch {
-              // fall through to CLI sync
-            }
-            const synced = syncClaudeCliCredentialsToOpenCode();
-            return synced?.access ?? null;
-          }
-          // Transient refresh failure: the old access token is only useful
-          // while actually valid; otherwise null lets the CLI self-heal.
-          return auth.access && auth.expires > Date.now()
-            ? auth.access
-            : null;
-        }
-      })();
-      refreshInFlight.set(key, pending);
-      const cleanup = () => {
-        refreshInFlight.delete(key);
-      };
-      pending.then(cleanup, cleanup);
-    }
-    return pending;
-  }
-
-  const synced = syncClaudeCliCredentialsToOpenCode();
-  if (synced) {
-    try {
-      await input.client.auth.set({
-        path: { id: PROVIDER_ID },
-        body: {
-          type: "oauth",
-          refresh: synced.refresh,
-          access: synced.access,
-          expires: synced.expires,
-        },
-      });
-    } catch {
-      // auth.set may be unavailable in some hosts
-    }
-    return synced.access;
-  }
-  return null;
 }
 
 async function loadClaudeRuntime(
@@ -603,7 +383,7 @@ export type ClaudeCodePluginOptions = {
   accounts?: unknown;
 };
 
-export const ClaudeCodePlugin: Plugin = async (
+const ClaudeCodePlugin: Plugin = async (
   input: PluginInput,
   options?: ClaudeCodePluginOptions,
 ): Promise<Hooks> => {
@@ -887,9 +667,16 @@ export const ClaudeCodePlugin: Plugin = async (
   };
 };
 
-export default ClaudeCodePlugin;
+/**
+ * Dual V1/V2 export (https://opencode.ai/v2/docs/build/plugins/migrate-v1,
+ * understood by OpenCode from 1.18.29): OpenCode 2 runs `setup`, OpenCode 1
+ * runs `server` — the V1 plugin above, unchanged.
+ */
+export default { ...createV2Plugin(), server: ClaudeCodePlugin };
 
 export type { ClaudeOAuthTokens };
-// Nada mas se exporta aqui: OpenCode invoca CADA export del entrypoint como
-// si fuera otro plugin. Los helpers viven en sus modulos (./detect.js,
-// ./models.js, ./proxy.js, ./request-context.js) y se importan desde alli.
+// Nada mas se exporta aqui: OpenCode 1 invoca CADA funcion exportada del
+// entrypoint como si fuera otro plugin, asi que ni siquiera ClaudeCodePlugin
+// va con nombre (se cargaria dos veces: suelto y como `server`). Los helpers
+// viven en sus modulos (./detect.js, ./models.js, ./proxy.js,
+// ./request-context.js) y se importan desde alli.

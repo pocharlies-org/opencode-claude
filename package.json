@@ -16,7 +16,8 @@
   },
   "files": [
     "dist",
-    "opencode-claude.js"
+    "opencode-claude.js",
+    "index.js"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
