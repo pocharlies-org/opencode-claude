@@ -115,6 +115,8 @@ import {
   type ClaudeEffort,
 } from "./constants.js";
 import { startClaudeQuery, type ClaudeQueryHandle } from "./query.js";
+import { localSummaryAnswer } from "./compaction.js";
+import { takeToolResult } from "./tool-results.js";
 import {
   bindConversationAccount,
   getSessionBinding,
@@ -162,7 +164,9 @@ import {
   requestKeyNamespace,
 } from "./request-kind.js";
 import {
+  createStepUsageTracker,
   formatCompactNote,
+  hostUsageFromTurnTotal,
   usageFromSdkResult,
   type OpenAIUsage,
 } from "./usage.js";
@@ -1449,7 +1453,10 @@ async function handleChatCompletions(
   if (existing && existing.pendingTools.size > 0) {
     let resolved = 0;
     for (const [toolId, tool] of existing.pendingTools) {
-      const result = toolResults.get(toolId);
+      // The request's own result wins; the host-side copy covers a request
+      // that lost it (OpenCode 2 compacting mid-turn, see tool-results.ts).
+      const remembered = takeToolResult(toolId);
+      const result = toolResults.get(toolId) ?? remembered;
       if (result !== undefined) {
         tool.resolve(result);
         existing.pendingTools.delete(toolId);
@@ -1504,7 +1511,7 @@ async function handleChatCompletions(
 
   const accessToken = getAccessToken ? await getAccessToken(account) : null;
 
-  // Title / summary: fast Anthropic Messages API path (not Agent SDK).
+  // Title: fast Anthropic Messages API path (not Agent SDK). Summary: local.
   // OpenCode fires these in parallel with the main turn and disposes the
   // session ~2–3s later — Agent SDK is too slow, so titles stayed "New session".
   if (metaKind) {
@@ -1534,6 +1541,25 @@ async function handleChatCompletions(
     let content: string;
     let usage: { prompt_tokens: number; completion_tokens: number } | undefined;
     let responseModel = body.model || "claude-haiku-4-5";
+
+    // Only titles take the fast path. A summary is a host-side compaction, and
+    // compacting a claude-code session buys nothing (the context lives in
+    // Claude Code, see compaction.ts) while the Messages-API call behind it is
+    // refused once the account has no extra usage — which OpenCode 1 stored as
+    // "Summary unavailable" and OpenCode 2 rejects, stopping the turn.
+    if (metaKind === "summary") {
+      content = localSummaryAnswer(messages);
+      log.info("[opencode-claude] summary answered locally (no model call)", {
+        conversationKey,
+        chars: content.length,
+      });
+      return metaChatCompletionResponse({
+        stream,
+        id: completionId,
+        model: responseModel,
+        content,
+      });
+    }
 
     // Titles and summaries are auxiliary requests. Never spend another API
     // request while this subscription is already known to be limited.
@@ -2151,9 +2177,11 @@ async function collectTurnResponse(
     errorText = text;
     content += `\n\n[claude-code error] ${text}`;
   };
+  const stepUsage = createStepUsageTracker();
 
   try {
     for await (const event of events) {
+      stepUsage.observe(event);
       const mapped = mapSdkEvent(event, bridge.accountId);
       if (mapped.kind === "park") {
         toolCalls.push(...mapped.tools);
@@ -2187,6 +2215,8 @@ async function collectTurnResponse(
   // Usage arrives once per completed Claude turn (the SDK result event), so
   // parked tool segments of the same turn do not inflate the counters.
   if (usage) recordTurnUsage(bridge.accountId, usage);
+  // The host gets this response's own usage (see createStepUsageTracker).
+  const hostUsage = stepUsage.snapshot() ?? (usage ? hostUsageFromTurnTotal(usage) : null);
 
   return Response.json({
     id: completionId,
@@ -2213,7 +2243,7 @@ async function collectTurnResponse(
         finish_reason: toolCalls.length ? "tool_calls" : "stop",
       },
     ],
-    ...(usage ? { usage } : {}),
+    ...(hostUsage ? { usage: hostUsage } : {}),
   });
 }
 
@@ -2447,8 +2477,10 @@ function streamOpenAIResponse(
         });
       };
 
+      const stepUsage = createStepUsageTracker();
       try {
         for await (const event of events) {
+          stepUsage.observe(event);
           const mapped = mapSdkEvent(event, bridge.accountId);
           if (mapped.kind === "park") {
             finishReason = "tool_calls";
@@ -2547,13 +2579,17 @@ function streamOpenAIResponse(
         finishReason = "stop";
       }
 
+      const hostUsage =
+        stepUsage.snapshot() ?? (usage ? hostUsageFromTurnTotal(usage) : null);
       send({
         id: completionId,
         object: "chat.completion.chunk",
         created,
         model,
         choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
-        ...(usage ? { usage } : {}),
+        // This response's own usage, parked tool segments included; the turn
+        // total below is for the plugin's counters, not the host's context.
+        ...(hostUsage ? { usage: hostUsage } : {}),
       });
       // Same rule as the buffered path: only a turn that reported usage is a
       // completed turn, so parked tool segments are not counted twice.

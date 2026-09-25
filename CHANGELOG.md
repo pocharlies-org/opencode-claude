@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- **The host gets the real usage of every step.** Each response now reports the
+  context of its LAST API call (uncached input + cache read + cache write, as
+  OpenAI-style `prompt_tokens`) and the output of all its calls, parked tool-call
+  steps included. Before, tool-call steps reported nothing and the final one
+  reported the SDK's sum over the whole tool loop with the cache left out of
+  `prompt_tokens` — OpenCode 2 read input 0 and, without a usable figure,
+  estimated the context from its own copy of the history and compacted sessions
+  whose context lives in Claude Code. OpenCode 1 showed the same wrong numbers
+  (a 140k-token turn as 0 + 937). The plugin's own counters keep the turn total.
+- **No host compaction for claude-code sessions.** On OpenCode 2 the `compaction`
+  session hook supplies a checkpoint (in V2's template) saying the context is kept
+  by Claude Code, so V2 skips the model request — manual or automatic. Any summary
+  request that still reaches the proxy (OpenCode 1) is answered locally; the fast
+  Messages-API path is for titles only. It was refused once the account had no
+  extra usage, and "Summary unavailable" stopped V2 turns.
+- **A parked turn survives a mid-turn compaction.** The V2 plugin keeps each
+  claude-code tool result (`tool.hook("execute.after")`, process-global because V2
+  loads the plugin once per location), and the proxy uses it when the next request
+  carries the history as text. Before, the proxy re-emitted the call and the host
+  ran the tool twice.
+
 - **OpenCode 2 support, same package.** The default export is now dual
   (`{ id, setup, server }`): OpenCode 2 runs `setup` (src/opencode2.ts), OpenCode 1
   keeps running the unchanged V1 plugin as `server`. On V2 the provider and its
