@@ -9,7 +9,7 @@
  * tool_calls; the follow-up request with tool results resumes the turn.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname as dirnamePath, join as joinPath } from "node:path";
 import {
@@ -425,11 +425,56 @@ async function isProxyHealthyAt(baseUrl: string): Promise<boolean> {
  * ephemeral port by default, so without this the address only exists inside
  * a log line the host may not surface.
  */
+function endpointPath(): string {
+  const xdg = process.env.XDG_DATA_HOME;
+  const base = xdg ? xdg : joinPath(homedir(), ".local", "share");
+  return joinPath(base, "opencode-claude", "endpoint.json");
+}
+
+/** What the owner of the shared listener published, or null. */
+function readPublishedEndpoint(): { port: number; pid: number } | null {
+  try {
+    const raw = JSON.parse(readFileSync(endpointPath(), "utf8")) as {
+      port?: unknown;
+      pid?: unknown;
+    };
+    const port = Number(raw.port);
+    const pid = Number(raw.pid);
+    return Number.isInteger(port) && Number.isInteger(pid) ? { port, pid } : null;
+  } catch {
+    return null;
+  }
+}
+
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as { code?: string }).code === "EPERM";
+  }
+}
+
+/**
+ * The pinned port is held and the health probe did not answer. MEDIDO el
+ * 27-09-2026: OpenCode 2 loads the plugin once per LOCATION (every OpenChamber
+ * session is its own directory), each with its own module graph, so a new
+ * location retries the bind the first location already owns. The probe that
+ * should tell "our own listener" from "a stranger" is a self-fetch, and with the
+ * event loop busy loading thirty locations it times out — the location then
+ * threw and published no Claude provider at all. The published endpoint is the
+ * better witness: if its pid is alive and it names the pinned port, the
+ * listener is ours (or a sibling's) and the catalogue goes on it.
+ */
+function publishedOwnerOfPinnedPort(): number | null {
+  const published = readPublishedEndpoint();
+  if (!published || published.port !== REQUESTED_PROXY_PORT) return null;
+  return isPidAlive(published.pid) ? published.pid : null;
+}
+
 function publishEndpoint(port: number): void {
   try {
-    const xdg = process.env.XDG_DATA_HOME;
-    const base = xdg ? xdg : joinPath(homedir(), ".local", "share");
-    const path = joinPath(base, "opencode-claude", "endpoint.json");
+    const path = endpointPath();
     mkdirSync(dirnamePath(path), { recursive: true });
     writeFileSync(
       path,
@@ -535,7 +580,7 @@ export async function startProxy(tokenProvider: TokenProvider): Promise<number> 
       proxyPort = REQUESTED_PROXY_PORT;
       publishEndpoint(proxyPort);
       startQuotaClock();
-      log.info(`[opencode-claude] reusing healthy proxy on ${pinnedUrl}`);
+      log.warn(`[opencode-claude] reusing healthy proxy on ${pinnedUrl}`);
       return proxyPort;
     }
   }
@@ -567,19 +612,43 @@ export async function startProxy(tokenProvider: TokenProvider): Promise<number> 
     );
     return proxyPort;
   } catch (err) {
-    if (
-      REQUESTED_PROXY_PORT > 0 &&
-      isAddrInUseError(err) &&
-      (await isProxyHealthyAt(`http://127.0.0.1:${REQUESTED_PROXY_PORT}/v1`))
-    ) {
+    if (!(REQUESTED_PROXY_PORT > 0 && isAddrInUseError(err))) throw err;
+    if (await isProxyHealthyAt(`http://127.0.0.1:${REQUESTED_PROXY_PORT}/v1`)) {
       proxyPort = REQUESTED_PROXY_PORT;
       publishEndpoint(proxyPort);
-      log.info(
+      log.warn(
         `[opencode-claude] port ${REQUESTED_PROXY_PORT} in use; reusing existing proxy`,
       );
       return proxyPort;
     }
-    throw err;
+    const owner = publishedOwnerOfPinnedPort();
+    if (owner !== null) {
+      proxyPort = REQUESTED_PROXY_PORT;
+      startQuotaClock();
+      log.warn(
+        `[opencode-claude] port ${REQUESTED_PROXY_PORT} in use and the probe did not answer; reusing the proxy published by pid ${owner}`,
+      );
+      return proxyPort;
+    }
+    // Held by a listener nobody vouches for. A proxy of our own on an ephemeral
+    // loopback port beats no proxy at all: the pinned port only exists so the
+    // panel has a stable URL behind the reverse proxy, and inference reaches the
+    // proxy through the baseURL this returns. The endpoint file and the quota
+    // clock stay with whoever owns the pinned port.
+    server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      idleTimeout: 255,
+      async fetch(req) {
+        return handleRequest(req);
+      },
+    });
+    proxyPort = server.port ?? null;
+    if (!proxyPort) throw err;
+    log.warn(
+      `[opencode-claude] port ${REQUESTED_PROXY_PORT} held by an unrecognised listener; serving on loopback port ${proxyPort} instead`,
+    );
+    return proxyPort;
   }
 }
 
