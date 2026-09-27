@@ -362,16 +362,35 @@ export function createV2Plugin(id = "opencode-claude") {
       // Bind the proxy before publishing the provider, so the baseURL below is
       // the live listener. startProxy is idempotent: a second location (or a
       // plugin reload) reuses the same listener.
+      //
+      // It is retried here because the cost of giving up once is the whole
+      // catalogue: `baseURL` stays undefined, the transform below adds nothing,
+      // and every Claude model disappears from the menu until some later reload
+      // happens to find a quiet event loop. MEDIDO el 27-09-2026 — one reload 6 s
+      // after a `dist/` rebuild, with the same process reloading six plugins and
+      // respawning MCP servers around it, lost all 28 Claude models that way.
+      // A slow probe is not a dead proxy, so the bind gets a few chances.
       let baseURL: string | undefined;
-      try {
-        const port = await startProxy(async (account) =>
-          resolveAccessToken(hostInput, async () => readPluginAuth(), account),
-        );
-        baseURL = `http://127.0.0.1:${port}/v1`;
-      } catch (err) {
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const port = await startProxy(async (account) =>
+            resolveAccessToken(hostInput, async () => readPluginAuth(), account),
+          );
+          baseURL = `http://127.0.0.1:${port}/v1`;
+          break;
+        } catch (err) {
+          log.error(
+            `[opencode-claude] proxy failed to start (attempt ${attempt}/3)`,
+            err instanceof Error ? err.message : err,
+          );
+          if (attempt < 3) {
+            await new Promise((resolve) => setTimeout(resolve, attempt * 1_000));
+          }
+        }
+      }
+      if (!baseURL) {
         log.error(
-          "[opencode-claude] proxy failed to start",
-          err instanceof Error ? err.message : err,
+          "[opencode-claude] no proxy after 3 attempts — Claude models will be missing from the catalogue until the next reload",
         );
       }
 

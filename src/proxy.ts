@@ -171,7 +171,10 @@ import {
   type OpenAIUsage,
 } from "./usage.js";
 
-const SHARED_PROXY_HEALTH_TIMEOUT_MS = 750;
+// One shot against a busy event loop is a coin flip — see isProxyHealthyAt.
+const SHARED_PROXY_HEALTH_TIMEOUT_MS = 1_500;
+const SHARED_PROXY_HEALTH_ATTEMPTS = 3;
+const SHARED_PROXY_HEALTH_BACKOFF_MS = 150;
 
 /**
  * Optional pinned port via OPENCODE_CLAUDE_PROXY_PORT.
@@ -365,7 +368,7 @@ function isAddrInUseError(err: unknown): boolean {
   );
 }
 
-async function isProxyHealthyAt(baseUrl: string): Promise<boolean> {
+async function probeProxyAt(baseUrl: string): Promise<boolean> {
   const controller = new AbortController();
   const timeout = setTimeout(
     () => controller.abort(),
@@ -389,6 +392,32 @@ async function isProxyHealthyAt(baseUrl: string): Promise<boolean> {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+/**
+ * A healthy listener answers `/v1/models` in milliseconds — when nothing else is
+ * running. MEDIDO el 27-09-2026: a plugin reload fired 6 s after a `dist/` rebuild,
+ * while the same process was also reloading 6 plugins and respawning every session's
+ * MCP servers. The single 750 ms probe timed out against a listener that was alive
+ * and correct, `startProxy` treated "port in use, probe slow" as "port squatted by
+ * a stranger", threw, and the caller left `baseURL` undefined — which dropped the
+ * whole Claude catalogue from the menu until a later reload happened to land on a
+ * quiet event loop. 28 models gone from one slow GET.
+ *
+ * So the probe gets retries. A live proxy still fails fast on a real refusal
+ * (`!res.ok` → next attempt), and the total is bounded: worst case
+ * attempts × timeout + backoff, well under a second of extra startup.
+ */
+async function isProxyHealthyAt(baseUrl: string): Promise<boolean> {
+  for (let attempt = 1; attempt <= SHARED_PROXY_HEALTH_ATTEMPTS; attempt++) {
+    if (await probeProxyAt(baseUrl)) return true;
+    if (attempt < SHARED_PROXY_HEALTH_ATTEMPTS) {
+      await new Promise((resolve) =>
+        setTimeout(resolve, SHARED_PROXY_HEALTH_BACKOFF_MS * attempt),
+      );
+    }
+  }
+  return false;
 }
 
 /**
