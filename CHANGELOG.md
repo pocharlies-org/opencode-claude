@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **A held proxy port no longer costs the Claude catalogue.** OpenCode 2 loads the
+  plugin once per location — every OpenChamber session is its own directory — and
+  each location retries the bind of the pinned `OPENCODE_CLAUDE_PROXY_PORT`. When
+  the self-probe timed out on a busy event loop the location threw, and the new
+  session's model picker had no Claude provider at all (measured 27-09-2026:
+  `proxy failed to start … Is port 8799 in use?`). Now a pinned port held by a
+  live pid named in `endpoint.json` is reused without the probe, and a port held
+  by a listener nobody vouches for gets a proxy of our own on an ephemeral
+  loopback port. Reuse is logged at `warn`, so the path is visible in the journal.
+
 - **The host gets the real usage of every step.** Each response now reports the
   context of its LAST API call (uncached input + cache read + cache write, as
   OpenAI-style `prompt_tokens`) and the output of all its calls, parked tool-call
