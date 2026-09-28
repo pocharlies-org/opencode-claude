@@ -1086,8 +1086,8 @@ async function main() {
                 id: "call_remembered",
                 name: "bash",
                 arguments: "{}",
-                resolve: (text: string) => {
-                  resolvedWith = text;
+                resolve: (result: { text: string }) => {
+                  resolvedWith = result.text;
                 },
                 reject: () => {},
               },
@@ -1123,6 +1123,65 @@ async function main() {
         assert.match(String(json.choices?.[0]?.message?.content ?? ""), /RESUMED/);
         assert.equal(json.choices?.[0]?.message?.tool_calls, undefined, "no re-emitted call");
         deleteBridge("bridge-remembered");
+      }
+
+      // Proxy: OpenCode 2 moves a tool's images into the user message after the
+      // tool results; they must reach the parked call, not only its text.
+      {
+        const { putBridge, deleteBridge } = await import("../src/bridge-pool.ts");
+        let resolvedWith: { text: string; images: Array<{ data: string; mimeType: string }> } | null = null;
+        putBridge({
+          id: "bridge-tool-image",
+          conversationKey: "smoke-tool-image",
+          handle: { stream: (async function* () {})(), interrupt: async () => {}, close: () => {}, getPid: () => null, readPlanUsage: async () => null },
+          pendingTools: new Map([
+            [
+              "call_tool_image",
+              {
+                id: "call_tool_image",
+                name: "read",
+                arguments: "{}",
+                resolve: (result: { text: string; images: Array<{ data: string; mimeType: string }> }) => {
+                  resolvedWith = result;
+                },
+                reject: () => {},
+              },
+            ],
+          ]),
+          createdAt: Date.now(),
+          continueStream: () =>
+            (async function* () {
+              yield { type: "result", is_error: false, usage: { input_tokens: 1, output_tokens: 1 } };
+            })(),
+        } as never);
+        await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-opencode-claude-session": "smoke-tool-image",
+          },
+          body: JSON.stringify({
+            model: "sonnet",
+            stream: false,
+            messages: [
+              { role: "user", content: "read the png" },
+              { role: "assistant", content: null, tool_calls: [{ id: "call_tool_image", type: "function", function: { name: "read", arguments: "{}" } }] },
+              { role: "tool", tool_call_id: "call_tool_image", content: "Image read successfully" },
+              {
+                role: "user",
+                content: [
+                  { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgo=" } },
+                  { type: "text", text: "<system-update>catalog</system-update>" },
+                ],
+              },
+            ],
+          }),
+        });
+        assert.deepEqual(resolvedWith, {
+          text: "Image read successfully",
+          images: [{ data: "iVBORw0KGgo=", mimeType: "image/png" }],
+        });
+        deleteBridge("bridge-tool-image");
       }
 
       // Proxy + mock SDK: hard limit error BEFORE any content — the proxy
@@ -4056,7 +4115,7 @@ async function main() {
 
       const provider = providers.get("claude-code");
       assert.ok(provider, "V2 registers the claude-code provider");
-      assert.equal(provider.provider.package, "aisdk:@ai-sdk/openai-compatible");
+      assert.equal(provider.provider.package, "@opencode/ai/providers/openai-compatible");
       assert.equal(provider.provider.activation, "enabled");
       assert.match(provider.provider.settings.baseURL, /^http:\/\/127\.0\.0\.1:\d+\/v1$/);
       assert.equal(provider.provider.settings.includeUsage, true);

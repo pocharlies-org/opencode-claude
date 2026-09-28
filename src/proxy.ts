@@ -19,6 +19,7 @@ import {
   putBridge,
   type ParkedBridge,
   type ParkedToolCall,
+  type ToolResultPayload,
 } from "./bridge-pool.js";
 import { withClaudeOAuthToken } from "./auth-env.js";
 import { hasClaudeCliOAuthCredentials } from "./credentials.js";
@@ -144,6 +145,7 @@ import {
 } from "./rate-limit.js";
 import {
   buildConversationTranscript,
+  contentImages,
   historyMaxChars,
   extractTextContent,
   latestUserPrompt,
@@ -1236,11 +1238,26 @@ async function handleRequest(req: Request): Promise<Response> {
 
 function collectToolResults(
   messages: OpenAIMessage[],
-): Map<string, string> {
-  const results = new Map<string, string>();
+): Map<string, ToolResultPayload> {
+  const results = new Map<string, ToolResultPayload>();
+  let lastToolId: string | undefined;
   for (const msg of messages) {
-    if (msg.role !== "tool" || !msg.tool_call_id) continue;
-    results.set(msg.tool_call_id, extractTextContent(msg.content));
+    if (msg.role === "tool" && msg.tool_call_id) {
+      results.set(msg.tool_call_id, {
+        text: extractTextContent(msg.content),
+        images: contentImages(msg.content),
+      });
+      lastToolId = msg.tool_call_id;
+      continue;
+    }
+    // A tool message on an OpenAI-compatible route is text only, so OpenCode 2
+    // moves a tool's images (`read` of a PNG) into a user message right after
+    // the results. They go back with the last result of that run; without
+    // this Claude only ever reads "Image read successfully".
+    if (msg.role === "user" && lastToolId) {
+      results.get(lastToolId)?.images.push(...contentImages(msg.content));
+    }
+    lastToolId = undefined;
   }
   return results;
 }
@@ -1554,7 +1571,9 @@ async function handleChatCompletions(
       // The request's own result wins; the host-side copy covers a request
       // that lost it (OpenCode 2 compacting mid-turn, see tool-results.ts).
       const remembered = takeToolResult(toolId);
-      const result = toolResults.get(toolId) ?? remembered;
+      const result =
+        toolResults.get(toolId) ??
+        (remembered === undefined ? undefined : { text: remembered, images: [] });
       if (result !== undefined) {
         tool.resolve(result);
         existing.pendingTools.delete(toolId);
@@ -2209,7 +2228,7 @@ async function buildOpenCodeMcpServer(
               resolve: () => {},
               reject: () => {},
             };
-            const resultPromise = new Promise<string>((resolve, reject) => {
+            const resultPromise = new Promise<ToolResultPayload>((resolve, reject) => {
               pending.resolve = resolve;
               pending.reject = reject;
             });
@@ -2218,7 +2237,14 @@ async function buildOpenCodeMcpServer(
             onPark();
             const result = await resultPromise;
             return {
-              content: [{ type: "text", text: result }],
+              content: [
+                { type: "text" as const, text: result.text },
+                ...result.images.map((image) => ({
+                  type: "image" as const,
+                  data: image.data,
+                  mimeType: image.mimeType,
+                })),
+              ],
             };
           },
           { alwaysLoad: true },

@@ -390,6 +390,18 @@ export function openaiContentToAnthropicBlocks(
   return blocks;
 }
 
+/** Inline (base64) images in OpenAI-shaped content, for an MCP tool result. */
+export function contentImages(
+  content: unknown,
+): Array<{ data: string; mimeType: string }> {
+  if (!Array.isArray(content)) return [];
+  return openaiContentToAnthropicBlocks(content).flatMap((block) =>
+    block.type === "image" && block.source.type === "base64"
+      ? [{ data: block.source.data, mimeType: block.source.media_type }]
+      : [],
+  );
+}
+
 /**
  * Latest user turn as a Claude Agent SDK prompt (string when text-only).
  */
