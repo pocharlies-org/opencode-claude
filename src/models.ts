@@ -58,6 +58,9 @@ const API_PRICING: Record<string, { input: number; output: number }> = {
   "Opus 5.5": { input: 5, output: 25 },
   "Opus 5": { input: 5, output: 25 },
   "Opus 4.8": { input: 5, output: 25 },
+  // Sonnet 5.5 (released 2026-09-28) is priced below Sonnet 5, not above it:
+  // $2 / $10 per MTok on the official model page.
+  "Sonnet 5.5": { input: 2, output: 10 },
   "Sonnet 5": { input: 3, output: 15 },
   "Sonnet 4.6": { input: 3, output: 15 },
   "Haiku 4.5": { input: 1, output: 5 },
@@ -141,6 +144,10 @@ const ALIAS_MODELS: ClaudeModel[] = [
  */
 const PINNED_MODELS: ClaudeModel[] = [
   model("claude-fable-5-1", "Fable 5.1", LIMIT_1M, "claude-fable-5-1[1m]"),
+  // Claude Code 2.1.284 already bundles `claude-sonnet-5-5`, but its alias table
+  // still reads `["sonnet",[5]]`, so the `sonnet` alias serves Sonnet 5. 5.5 is
+  // reachable only by pinning the id; `[1m]` keeps the CLI from assuming 200k.
+  model("claude-sonnet-5-5", "Sonnet 5.5", LIMIT_1M, "claude-sonnet-5-5[1m]"),
   model("claude-opus-5", "Opus 5", LIMIT_1M),
   model("claude-opus-4-8", "Opus 4.8", LIMIT_1M),
   model("claude-sonnet-4-6", "Sonnet 4.6", LIMIT_1M),

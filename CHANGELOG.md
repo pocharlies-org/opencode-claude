@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Claude Sonnet 5.5 is in the catalogue.** Anthropic released `claude-sonnet-5-5`
+  on 2026-09-28 (1M context, $2 / $10 per MTok). Claude Code 2.1.284 bundles the
+  id but its alias table still reads `["sonnet",[5]]`, so the `sonnet` alias keeps
+  serving Sonnet 5 — 5.5 is reachable only by pinning the id, the same way
+  `claude-fable-5-1[1m]` is pinned. Added a pinned `claude-sonnet-5-5` model
+  (resolved id `claude-sonnet-5-5[1m]` so the CLI does not assume a 200k window)
+  and its list price.
+
 - **A held proxy port no longer costs the Claude catalogue.** OpenCode 2 loads the
   plugin once per location — every OpenChamber session is its own directory — and
   each location retries the bind of the pinned `OPENCODE_CLAUDE_PROXY_PORT`. When
