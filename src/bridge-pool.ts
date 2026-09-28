@@ -4,11 +4,17 @@
  */
 import type { ClaudeQueryHandle } from "./query.js";
 
+/** An image a tool returned, as an MCP `image` content block carries it. */
+export type ToolResultImage = { data: string; mimeType: string };
+
+/** A tool's output as the MCP bridge hands it back to Claude. */
+export type ToolResultPayload = { text: string; images: ToolResultImage[] };
+
 export type ParkedToolCall = {
   id: string;
   name: string;
   arguments: string;
-  resolve: (result: string) => void;
+  resolve: (result: ToolResultPayload) => void;
   reject: (error: Error) => void;
 };
 

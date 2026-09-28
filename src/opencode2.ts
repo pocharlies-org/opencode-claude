@@ -81,8 +81,14 @@ import {
 } from "./token.js";
 import { buildAccountTools } from "./tools.js";
 
-/** The AI SDK driver V2 uses for an OpenAI-compatible endpoint — the proxy is one. */
-const PACKAGE = "aisdk:@ai-sdk/openai-compatible";
+/**
+ * V2's native OpenAI-compatible driver — the proxy is one. Not the
+ * `aisdk:@ai-sdk/openai-compatible` route: V2 installs that package @latest
+ * (3.x, file parts as `{ type: "data" | "url" }`) but lowers media with a bare
+ * base64 string, so every image reached the proxy as `null` and Claude never
+ * saw an attachment. The native driver emits `image_url` itself.
+ */
+const PACKAGE = "@opencode/ai/providers/openai-compatible";
 const PROXY_API_KEY = "claude-code-proxy";
 const INPUT_MODALITIES = ["text", "image", "pdf"];
 
