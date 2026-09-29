@@ -37,6 +37,15 @@ async function main() {
     RefreshTokenInvalidError,
   } = await import("../src/auth.ts");
   const { generatePKCE } = await import("../src/pkce.ts");
+
+  // A CLI killed by the service stop (SIGTERM, exit 143) must not be read as a
+  // finished turn; any other failure keeps closing the turn as before.
+  const { isSigtermKill } = await import("../src/proxy.ts");
+  assert.equal(isSigtermKill("Claude Code process exited with code 143"), true);
+  assert.equal(isSigtermKill("process terminated by signal SIGTERM"), true);
+  assert.equal(isSigtermKill("Claude Code process exited with code 1"), false);
+  assert.equal(isSigtermKill("exited with code 1430"), false);
+  assert.equal(isSigtermKill("usage limit reached"), false);
   const {
     extractClaudeOAuthCredentials,
     listClaudeCredentialsCandidates,

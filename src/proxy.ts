@@ -2332,6 +2332,16 @@ async function collectTurnResponse(
     noteError(message);
   }
 
+  if (errorText && isSigtermKill(errorText)) {
+    log.warn("[opencode-claude] Claude CLI killed by SIGTERM; turn left open", {
+      conversationKey: bridge.conversationKey,
+    });
+    return Response.json(
+      { error: { message: errorText, type: "server_error", code: "claude_cli_sigterm" } },
+      { status: 503 },
+    );
+  }
+
   if (!sawContent && errorText) {
     return failureResponse(errorText, bridge.conversationKey, bridge.accountId);
   }
@@ -2582,6 +2592,7 @@ function streamOpenAIResponse(
       let finishReason: string | null = "stop";
       let usage: OpenAIUsage | null = null;
       let lastErrorNorm: string | null = null;
+      let killedBySigterm = false;
       const sendError = (text: string) => {
         const norm = normalizeClaudeErrorText(text);
         if (!norm || norm === lastErrorNorm) return;
@@ -2679,6 +2690,10 @@ function streamOpenAIResponse(
           if (mapped.kind === "error") {
             finishReason = "stop";
             if (mapped.usage) usage = mapped.usage;
+            if (isSigtermKill(mapped.text)) {
+              killedBySigterm = true;
+              break;
+            }
             forgetDeadSession(bridge.conversationKey, mapped.text);
             log.warn("[opencode-claude] mid-stream turn error", {
               conversationKey: bridge.conversationKey,
@@ -2690,17 +2705,31 @@ function streamOpenAIResponse(
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        // A limit/result failure typically arrives here right after the SDK
-        // emitted the same text as a result event — dedupe via sendError.
-        recordRateLimitErrorText(message, bridge.accountId);
-        forgetDeadSession(bridge.conversationKey, message);
-        log.warn("[opencode-claude] stream iterator failed", {
+        if (isSigtermKill(message)) {
+          killedBySigterm = true;
+        } else {
+          // A limit/result failure typically arrives here right after the SDK
+          // emitted the same text as a result event — dedupe via sendError.
+          recordRateLimitErrorText(message, bridge.accountId);
+          forgetDeadSession(bridge.conversationKey, message);
+          log.warn("[opencode-claude] stream iterator failed", {
+            conversationKey: bridge.conversationKey,
+            kind: classifyClaudeFailure(message),
+            message: message.slice(0, 300),
+          });
+          sendError(message);
+          finishReason = "stop";
+        }
+      }
+
+      if (killedBySigterm) {
+        // No finish chunk and no [DONE]: an aborted body is what makes the host
+        // treat the turn as interrupted instead of completed (see isSigtermKill).
+        log.warn("[opencode-claude] Claude CLI killed by SIGTERM; stream aborted", {
           conversationKey: bridge.conversationKey,
-          kind: classifyClaudeFailure(message),
-          message: message.slice(0, 300),
         });
-        sendError(message);
-        finishReason = "stop";
+        controller.error(new Error("claude-code terminated by SIGTERM"));
+        return;
       }
 
       const hostUsage =
@@ -2738,6 +2767,21 @@ type MappedEvent =
   | { kind: "usage"; usage: OpenAIUsage }
   | { kind: "error"; text: string; usage?: OpenAIUsage | null }
   | { kind: "ignore" };
+
+/**
+ * The Claude CLI killed by SIGTERM (exit 143). In practice this is the host
+ * service stopping: systemd sends SIGTERM to the whole cgroup and the CLI dies
+ * before the host does. Closing that turn with a finish_reason tells the host
+ * it ended fine — V2 then marks it idle/succeeded, clears `time_suspended`, and
+ * nothing ever resumes it. Such a turn is aborted instead (see callers): the
+ * host either interrupts it as part of its own shutdown or records a transport
+ * failure, and both are resumable.
+ */
+const SIGTERM_KILL_PATTERN = /exited with code 143\b|\bsignal:? ?SIGTERM\b|killed by SIGTERM/i;
+
+export function isSigtermKill(text: string): boolean {
+  return SIGTERM_KILL_PATTERN.test(text);
+}
 
 /** claude CLI text when `resume` points at a session it cannot load. */
 const LOST_SESSION_PATTERN =
