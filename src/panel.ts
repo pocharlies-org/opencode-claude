@@ -31,7 +31,9 @@ main { max-width: 60rem; margin: 0 auto; }
 h1 { font-size: 1.35rem; margin: 0 0 .25rem; letter-spacing: -.01em; }
 h2 { font-size: 1rem; margin: 2.25rem 0 .75rem; letter-spacing: -.01em; }
 .sub { color: var(--muted); margin: 0 0 1.5rem; font-size: .9rem; }
-.cards { display: grid; gap: .875rem; grid-template-columns: repeat(auto-fill, minmax(19rem, 1fr)); }
+/* Four accounts: 2x2 inside the 60rem column, one column below ~39rem.
+   auto-fill at 19rem fitted three and left the fourth card alone on row two. */
+.cards { display: grid; gap: .875rem; grid-template-columns: repeat(auto-fill, minmax(max(19rem, calc((100% - .875rem) / 2)), 1fr)); }
 .card {
   background: var(--card); border: 1px solid var(--line); border-radius: 10px;
   padding: 1rem 1.1rem;
