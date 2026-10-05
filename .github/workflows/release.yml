@@ -30,6 +30,7 @@ permissions:
 
 jobs:
   release:
+    # 2026-10-05 devops · fuera de pool temporal: el job usa node/bun del toolcache antes de setup-node; migrar al adelantar actions/setup-node/setup-bun (skill ci-runners-arc, INFRA-548)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
