@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **The quota the panel serves comes from the house account service**
+  (claude-account-switcher, SC-2453): `/accounts`, `/quota` and the refresh
+  button show the same numbers the account-jump tables decide on, and
+  `?refresh=stale` / `POST /accounts/:id/quota/refresh` ask the service to
+  re-read every account now (`POST /v1/refresh`, free usage GETs). Refreshing
+  no longer spends a measured call of its own. When the service is not there
+  the panel's own telemetry remains as the fallback and the answer says so
+  (`quotaSource`).
+
 - **A held proxy port no longer costs the Claude catalogue.** OpenCode 2 loads the
   plugin once per location — every OpenChamber session is its own directory — and
   each location retries the bind of the pinned `OPENCODE_CLAUDE_PROXY_PORT`. When

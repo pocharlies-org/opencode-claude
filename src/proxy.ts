@@ -96,6 +96,8 @@ import {
   recordQuotaRefreshError,
   renameAccountQuota,
 } from "./quota.js";
+import type { AccountQuota } from "./quota.js";
+import { cuotasDelServicio } from "./account-service.js";
 import {
   classifyClaudeFailure,
   failureHintFor,
@@ -749,11 +751,17 @@ async function readJsonBody(req: Request): Promise<Record<string, unknown>> {
   }
 }
 
-/** Account payload for the panel: identity, auth state, limits and usage. */
+const claveCuenta = (id: string): string => id.trim().toLowerCase();
+
+/** Account payload for the panel: identity, auth state, limits and usage.
+ *  `cuota` overrides the served numbers (SC-2453: the account service's);
+ *  `undefined` keeps the local harvest, `null` means the service has none. */
 function describeAccount(
   account: ClaudeAccount,
   sessionCounts: Map<string, number>,
+  cuota?: AccountQuota | null,
 ): Record<string, unknown> {
+  const q = cuota === undefined ? getAccountQuota(account.id) : cuota;
   return {
     id: account.id,
     label: account.label,
@@ -765,12 +773,12 @@ function describeAccount(
     sessions: sessionCounts.get(account.id) ?? 0,
     rateLimit: getRateLimitSnapshot(Date.now(), account.id),
     usage: getAccountUsage(account.id),
-    quota: getAccountQuota(account.id),
+    quota: q,
     // SC-51: quota data that stopped updating is not healthy data. The age
     // and the last refresh failure travel with the numbers so the panel can
     // show "old and why" instead of old-looking-fresh.
     quotaDataAgeMs: (() => {
-      const fetchedAt = getAccountQuota(account.id)?.fetchedAt;
+      const fetchedAt = q?.fetchedAt;
       return fetchedAt ? Math.max(0, Date.now() - fetchedAt) : null;
     })(),
     quotaRefreshError: getQuotaRefreshError(account.id),
@@ -890,19 +898,29 @@ async function handlePanelRoutes(
   }
 
   if (req.method === "GET" && path === "/accounts") {
-    // The LAN route deliberately bypasses Keycloak for GETs only. A one-shot
-    // refresh requested by the panel therefore has to happen inside this GET;
-    // all account-management mutations remain POST/DELETE and stay protected.
-    // Normal 15s panel polling omits the flag, so it never spends quota.
-    if (url.searchParams.get("refresh") === "stale") {
-      await refreshStaleQuotas("panel");
-    }
+    // SC-2453: the served numbers come from the account service, which reads
+    // each account's own usage endpoint for free. The LAN route bypasses
+    // Keycloak for GETs, so the one-shot refresh happens inside this GET:
+    // `refresh=stale` asks the service to re-read now (POST /v1/refresh).
+    // Normal 15s polling omits the flag and just serves the last reading.
+    // With no service reachable the rows fall back to the local harvest,
+    // declared by `quotaSource`; the harvest timer keeps that store warm.
+    const cuotas = await cuotasDelServicio(
+      url.searchParams.get("refresh") === "stale",
+    );
     const counts = sessionCountsByAccount();
     return Response.json({
       object: "list",
       multiAccount: isMultiAccount(),
       registryPath: getAccountsFilePath(),
-      data: getAccounts().map((account) => describeAccount(account, counts)),
+      quotaSource: cuotas ? "account-service" : "harvest",
+      data: getAccounts().map((account) =>
+        describeAccount(
+          account,
+          counts,
+          cuotas ? cuotas.get(claveCuenta(account.id)) ?? null : undefined,
+        ),
+      ),
     });
   }
 
@@ -913,11 +931,14 @@ async function handlePanelRoutes(
     });
   }
 
-  // Last known quota per account. Read-only and free: refreshing costs a real
-  // (tiny) request, so it is a separate explicit POST.
+  // Last known quota per account. Read-only and free: refreshing is the
+  // explicit POST on the account service (SC-2453).
   if (req.method === "GET" && path === "/quota") {
     const now = Date.now();
-    const accounts = getAllAccountQuota();
+    const desdeServicio = await cuotasDelServicio(false);
+    const accounts: Record<string, AccountQuota> = desdeServicio
+      ? Object.fromEntries(desdeServicio)
+      : getAllAccountQuota();
     return Response.json({
       object: "quota",
       accounts,
@@ -1041,12 +1062,12 @@ async function handlePanelRoutes(
         return Response.json({ disconnected: id });
       }
       if (req.method === "POST" && action === "quota/refresh") {
-        // Costs one minimal Messages call against the window it measures —
-        // operator-initiated only, never on a timer.
-        const quota = await probeAccountQuota(account);
-        // The profile call is free, so refresh identity while we are here.
+        // SC-2453: refresh asks the account service to re-read every account
+        // (free usage endpoint) and serves this one's numbers; the panel no
+        // longer spends a measured call of its own. Null = no service, no numbers.
+        const cuotas = await cuotasDelServicio(true);
         await fetchAccountIdentity(account).catch(() => null);
-        return Response.json(quota);
+        return Response.json(cuotas ? cuotas.get(claveCuenta(id)) ?? null : null);
       }
       if (req.method === "POST" && action === "login/start") {
         // Close the loop automatically when we know our own address: the

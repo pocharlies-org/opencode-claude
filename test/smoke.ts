@@ -3888,6 +3888,79 @@ async function main() {
     rmSync(accountsDir, { recursive: true, force: true });
   }
 
+  // ---- Account service client: the quota the panel serves (SC-2453) ----
+  {
+    const { mkdtempSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { cuotasDelServicio } = await import("../src/account-service.ts");
+    const leidos: Array<{ metodo: string; ruta: string; bearer: string; cuerpo: string }> = [];
+    const estado = {
+      accounts: [
+        {
+          id: "Work",
+          quota: {
+            readAt: new Date(Date.now() - 5000).toISOString(),
+            fiveHour: { usedPct: 41, resetsAt: new Date(Date.now() + 7200_000).toISOString() },
+            sevenDay: { usedPct: 100, resetsAt: null },
+          },
+        },
+        { id: "idle", quota: null },
+      ],
+    };
+    const servidor = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(req) {
+        const u = new URL(req.url);
+        leidos.push({
+          metodo: req.method,
+          ruta: u.pathname,
+          bearer: req.headers.get("authorization") ?? "",
+          cuerpo: req.method === "POST" ? await req.text() : "",
+        });
+        return Response.json(estado);
+      },
+    });
+    const dir = mkdtempSync(join(tmpdir(), "cuentas-"));
+    const json = join(dir, "service.json");
+    const antes = process.env.CLAUDE_CUENTAS_SERVICE_JSON;
+    process.env.CLAUDE_CUENTAS_SERVICE_JSON = json;
+    try {
+      writeFileSync(json, JSON.stringify({ v: 1, url: `http://127.0.0.1:${servidor.port}`, token: "t-token" }));
+      const cuotas = await cuotasDelServicio(false);
+      assert.equal(cuotas?.size, 1); // the account without a quota is simply absent
+      const q = cuotas?.get("work"); // ids are keyed lowercased
+      assert.equal(q?.windows.fiveHour?.utilization, 0.41);
+      assert.ok(Math.abs((q?.windows.fiveHour?.remaining ?? 0) - 0.59) < 1e-9);
+      assert.equal(q?.windows.sevenDay?.utilization, 1);
+      assert.equal(typeof q?.windows.fiveHour?.resetsAt, "number");
+      assert.equal(q?.windows.sevenDay?.resetsAt, undefined);
+      assert.ok(q && Date.now() - q.fetchedAt < 60_000);
+      assert.deepEqual(
+        leidos.map((l) => [l.metodo, l.ruta]),
+        [["GET", "/v1/state"]],
+      );
+      assert.equal(leidos[0].bearer, "Bearer t-token");
+
+      leidos.length = 0;
+      await cuotasDelServicio(true);
+      assert.deepEqual(
+        leidos.map((l) => [l.metodo, l.ruta, l.cuerpo]),
+        [["POST", "/v1/refresh", "{}"], ["GET", "/v1/state", ""]],
+      );
+
+      writeFileSync(json, JSON.stringify({ v: 1, url: "http://example.com:1", token: "t" }));
+      assert.equal(await cuotasDelServicio(false), null); // only loopback is ever called
+      writeFileSync(json, JSON.stringify({ v: 1, url: `http://127.0.0.1:${servidor.port}` }));
+      assert.equal(await cuotasDelServicio(false), null); // no token, no service
+    } finally {
+      if (antes === undefined) delete process.env.CLAUDE_CUENTAS_SERVICE_JSON;
+      else process.env.CLAUDE_CUENTAS_SERVICE_JSON = antes;
+      servidor.stop();
+    }
+  }
+
   // ---- CLI credential sync poisoning guards ----
   {
     const { syncClaudeCliCredentialsToOpenCode } = await import(
