@@ -446,6 +446,11 @@ document.addEventListener("click", async (event) => {
       const q = await api("v1/accounts/" + encodeURIComponent(id) + "/quota/refresh", {
         method: "POST",
       });
+      if (!q) {
+        note(id + ": no account service, no numbers.", "err");
+        await refresh();
+        return;
+      }
       const w = q.windows || {};
       note(
         id + ": " +
