@@ -304,8 +304,8 @@ account here.
 - `GET /v1/usage` → per-account turns and tokens: totals, today, last 7 days,
   and a daily series (30 days retained). Subscription turns are not metered
   API calls, so no cost figure is reported.
-- `GET /v1/quota` → how much of each subscription is **left**, straight from
-  Anthropic (see below).
+- `GET /v1/quota` → how much of each subscription is **left** — the account
+  service's numbers, the panel's harvest when there is no service (see below).
 - Each account in `GET /v1/accounts` carries `identity` (email, organization)
   plus `sharesLoginWith` / `sharesOrganizationWith`.
 - `GET /v1/sessions` → each conversation with the account it runs on (filter
@@ -355,17 +355,22 @@ window at 56% looks healthy while the weekly window at 93% is what will stop
 the next turn. The Agent SDK's `rate_limit_event` reports one window at a time,
 so it cannot tell you this on its own.
 
-The plugin gets those numbers two ways:
+What the panel **serves** (`/accounts`, `/quota`, refresh) comes from the house
+account service, claude-account-switcher (SC-2453): `~/.config/claude-cuentas/service.json`
+carries its loopback URL and bearer, `GET /v1/state` carries every account's
+windows, and a refresh asks the service to re-read them now (`POST /v1/refresh`
+— free usage GETs, no tokens spent). One source of truth, shared with the
+account-jump tables. When the service is not there the rows fall back to the
+panel's own telemetry and say so in `quotaSource`:
 
 - **Free.** It harvests the headers from requests it already makes (the
   title/summary path), including failed ones — a 429 carries them too, and
   that is exactly when they matter.
-- **On demand.** `POST /v1/accounts/:id/quota/refresh`, or **Check quota** in
-  the panel, sends the smallest possible real Messages call (~20 input tokens).
+- **On a slow timer.** Every ~30 min the panel probes the smallest possible
+  real Messages call (~20 input tokens) for accounts whose reading went stale,
+  keeping the fallback store — and the failover verdicts that read it — warm.
   `count_tokens` would be free but returns no rate-limit headers, so it cannot
-  serve as the probe. Nothing calls this on a timer — spending quota to measure
-  quota is a bad trade, and the panel's auto-refresh only re-renders what is
-  already cached.
+  serve as the probe.
 
 The panel shows each window as *percent left* with a reset countdown, marks the
 binding one, and colours it amber under 25% and red under 10%.
