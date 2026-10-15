@@ -3640,7 +3640,12 @@ async function main() {
         const added = addAccount({
           id: "panel-test",
           label: "Panel Test",
-          configDir: joinPath(panelDir, "claude-panel-test"),
+          // SC-2312: panel-created homes live inside the accounts base (the
+          // operator's home by default) — /tmp would be refused.
+          configDir: joinPath(
+            await import("node:os").then((m) => m.homedir()),
+            ".claude-panel-test",
+          ),
         });
         assert.equal(added.id, "panel-test");
         assert.equal(findAccount("panel-test")?.label, "Panel Test");
@@ -3763,6 +3768,89 @@ async function main() {
             null,
             "and nothing was created",
           );
+
+          // SC-2312: the socket decides what a no-Origin mutation may do. A
+          // curl from another box (LAN, tailnet, a pod) used to reach every
+          // write; now only loopback passes without the edge proof. The
+          // decision table is pinned directly because the test cannot open a
+          // non-loopback socket against itself.
+          const { authorizeMutation } = await import("../src/proxy.ts");
+          const { writeFileSync: wfs } = await import("node:fs");
+          const proofFile = joinPath(panelDir, "edge-proof");
+          const prevProofEnv = process.env.OPENCODE_CLAUDE_EDGE_PROOF_FILE;
+          process.env.OPENCODE_CLAUDE_EDGE_PROOF_FILE = proofFile;
+          const noOriginPost = new Request("http://x/v1/accounts", { method: "POST" });
+          assert.equal(
+            authorizeMutation(noOriginPost, "127.0.0.1")?.status ?? 200,
+            200,
+            "loopback socket passes without Origin or proof",
+          );
+          assert.equal(
+            authorizeMutation(noOriginPost, "10.42.7.9")?.status,
+            401,
+            "a pod socket without proof is refused (no proof file yet)",
+          );
+          wfs(proofFile, "s3cret-proof\n", "utf8");
+          assert.equal(
+            authorizeMutation(noOriginPost, "192.168.50.5")?.status,
+            401,
+            "a LAN socket without the header is refused",
+          );
+          assert.equal(
+            authorizeMutation(
+              new Request("http://x/v1/accounts", {
+                method: "POST",
+                headers: { "X-Edge-Proof": "wrong" },
+              }),
+              "100.83.56.98",
+            )?.status,
+            401,
+            "a forged proof value is refused",
+          );
+          assert.equal(
+            authorizeMutation(
+              new Request("http://x/v1/accounts", {
+                method: "POST",
+                headers: { "X-Edge-Proof": "s3cret-proof" },
+              }),
+              "100.83.56.98",
+            ),
+            null,
+            "Traefik with the real proof passes",
+          );
+          assert.equal(
+            authorizeMutation(
+              new Request("http://x/v1/accounts", {
+                method: "POST",
+                headers: { Origin: "https://evil.example" },
+              }),
+              "127.0.0.1",
+            )?.status,
+            403,
+            "cross-origin is refused even from loopback",
+          );
+          if (prevProofEnv === undefined) delete process.env.OPENCODE_CLAUDE_EDGE_PROOF_FILE;
+          else process.env.OPENCODE_CLAUDE_EDGE_PROOF_FILE = prevProofEnv;
+
+          // SC-2312: configDir confinement — a panel/tool-created home may not
+          // leave the accounts base (no traversal, no foreign absolute path).
+          const baseHome = await import("node:os").then((m) => m.homedir());
+          assert.throws(
+            () => addAccount({ id: "pwn", configDir: "/etc/oc-claude-pwn" }),
+            /must live under/,
+            "an absolute path outside the base is refused",
+          );
+          assert.throws(
+            () => addAccount({ id: "pwn2", configDir: joinPath(baseHome, ".claude-x/../../etc") }),
+            /must live under/,
+            "a .. traversal out of the base is refused",
+          );
+          const homeBound = addAccount({
+            id: "home-bound",
+            configDir: joinPath(baseHome, ".claude-home-bound"),
+          });
+          assert.equal(homeBound.id, "home-bound");
+          removeAccount("home-bound");
 
           // Regression: the guard tested for loopback, so once the panel was
           // served through a reverse proxy its OWN fetches (carrying the proxy

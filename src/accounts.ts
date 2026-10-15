@@ -22,7 +22,7 @@
  */
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { log } from "./log.js";
 import { countBoundSessions } from "./session-store.js";
 
@@ -552,6 +552,21 @@ export function addAccount(input: {
   const configDir = expandHome(rawDir);
   if (!isAbsolute(configDir)) {
     throw new AccountError("configDir must be an absolute path (or start with ~)");
+  }
+  // SC-2312: creating an account mkdirs and binds a Claude home, so the panel
+  // must not let a caller plant one anywhere on the host. A new home may only
+  // live inside the plugin's accounts base — the operator's home by default,
+  // the directory the `~/.claude-<id>` convention lives in; the env override
+  // exists for tests. resolve() has already collapsed any `..`, so a traversal
+  // that leaves the base lands outside it and is refused like any foreign
+  // absolute path. accounts.json edited by hand stays the operator's path and
+  // is not restricted.
+  const base = resolve(process.env.OPENCODE_CLAUDE_ACCOUNTS_BASE || homedir());
+  const resolvedDir = resolve(configDir);
+  if (resolvedDir !== base && !resolvedDir.startsWith(base + sep)) {
+    throw new AccountError(
+      `configDir must live under ${base} — no ".." and no absolute path outside it`,
+    );
   }
   if (existing.some((a) => accountConfigDir(a) === configDir)) {
     throw new AccountError(
