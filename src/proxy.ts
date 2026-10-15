@@ -690,6 +690,54 @@ function isLocalOrigin(req: Request): boolean {
   }
 }
 
+/**
+ * SC-2312 (security, 15-10-2026): same-origin alone was not enough. A request
+ * with no Origin header — curl from any LAN box, tailnet peer or cluster pod —
+ * passed `isLocalOrigin` and could add, delete or re-default accounts on the
+ * panel. A mutation is now authorized by the SOCKET, which cannot be forged
+ * over HTTP:
+ *
+ *   * loopback socket → the machine's own tooling (curl, xh, claude-rc-status)
+ *     keeps working, with or without Origin.
+ *   * anything else (Traefik LAN/edge, direct hits) → must carry the DGX-729
+ *     edge proof (`X-Edge-Proof`, injected by the forwardAuth middleware on the
+ *     panel routes). The plugin reads the expected value from a 0600 file —
+ *     the bearer-file pattern of the accounts service
+ *     (`~/.config/claude-cuentas/<id>.token`) — synced from the in-cluster
+ *     Secret `dgx-edge-proof` by the opencode-edge-proof-sync unit. Fail-closed:
+ *     no file or no header means no mutation from outside the machine.
+ *
+ * Exported for the smoke test, which cannot open a non-loopback socket against
+ * itself and so pins the decision table directly.
+ */
+export function authorizeMutation(
+  req: Request,
+  socketIp: string | undefined,
+): { message: string; status: number } | null {
+  if (!isLocalOrigin(req)) {
+    return { message: "cross-origin requests are not accepted by the panel", status: 403 };
+  }
+  const addr = (socketIp || "").replace(/^::ffff:/, "");
+  if (addr === "127.0.0.1" || addr === "::1" || addr.startsWith("127.")) return null;
+  const file =
+    process.env.OPENCODE_CLAUDE_EDGE_PROOF_FILE ||
+    joinPath(homedir(), ".config", "claude-cuentas", "edge-proof");
+  let proof: string;
+  try {
+    proof = readFileSync(file, "utf8").trim();
+  } catch {
+    proof = "";
+  }
+  const got = req.headers.get("x-edge-proof");
+  if (!proof || !got || got !== proof) {
+    return {
+      message: "mutations from outside this machine need the edge proof",
+      status: 401,
+    };
+  }
+  return null;
+}
+
 /** Minimal page the browser lands on after the OAuth redirect. */
 function callbackPage(ok: boolean, message: string): Response {
   const colour = ok ? "#2f7d4f" : "#b3372c";
@@ -993,8 +1041,11 @@ async function handlePanelRoutes(
     req.method !== "GET" &&
     (path === "/accounts" || accountMatch !== null || sessionMatch !== null);
 
-  if (isMutation && !isLocalOrigin(req)) {
-    return jsonError("cross-origin requests are not accepted by the panel", 403);
+  if (isMutation) {
+    // SC-2312: loopback socket, or the Traefik-injected edge proof. See
+    // authorizeMutation for the why.
+    const denied = authorizeMutation(req, server?.requestIP(req)?.address);
+    if (denied) return jsonError(denied.message, denied.status);
   }
 
   try {
